@@ -390,6 +390,8 @@ individually without touching the account.
 Repository **Settings → Actions → General → Workflow permissions** is set to
 **Read and write**, and the workflow additionally declares:
 
+## 4. Code Changes
+
 ### Update the pom.xml file
 
 1. Change the version field in the pom.xml file, currently it states `<version>1.0-SNAPSHOT</version>`,
@@ -426,3 +428,22 @@ Create a git ignore file and add the follwing :
  - target/ - the .jar output, shouldnt be in the repo
  - *.versionsBackup - the pom backup created by the versions plugins (safty net)
  - .vscode/ - vs code settings
+
+### Change the App.java
+
+Add my name to the App.java file as requested in the assigment
+
+## 5 Local Build
+
+Built the `.jar` file locally to check the app is built and runs correctliy
+Use the folwwing command to built, the -B flag runs the comand in batch mode 
+which dosent show progress bar and soent dirty the screen
+```bash
+mvn -B clean package
+```
+Check the name of the `.jar` file is as follow : `myapp-1.0.0.jar`
+Use the follwing command to run the .jar file
+```bash
+java -jar myapp-1.0.0.jar
+```
+Check you get back the string `Hello World from Noam!`

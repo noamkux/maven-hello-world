@@ -44,6 +44,66 @@ The tag is created last, after the image has been built, published, pulled and
 run. A failure anywhere earlier leaves no tag, so the version sequence has no
 gaps for builds that never produced an image.
 
+### Versioning Strategy
+
+Two approaches were considered, and the project switched from the first to the
+second during implementation.
+
+### Option A — version lives in pom.xml
+
+`mvn versions:set` rewrites `<version>` on every run, and the pipeline commits
+the modified file back to the branch.
+
+**For:** the exercise is written around "the jar version", and this makes that
+version visibly present and incrementing in the file. The whole mechanism can be
+demonstrated by running the pipeline twice and looking at one line of XML.
+
+**Against, and this is what decided it:**
+
+- **It breaks the Docker layer cache, every run.** BuildKit hashes each layer
+  against the result of the layers before it, so the dependency layer's key
+  includes the output of `COPY myapp/pom.xml`. Rewriting one character of the
+  version changes that file's hash entirely, invalidating the
+  `dependency:go-offline` layer beneath it even though the command is unchanged.
+  Every Maven dependency is re-downloaded on every CI run, defeating the `COPY`
+  split the Dockerfile is structured around. The split still works locally, where
+  only sources change — but in the pipeline the pom changes by construction.
+- **It requires writing to a protected branch,** forcing either a bot bypass on
+  the ruleset or no protection at all.
+- **It creates a trigger loop** — the bump commit triggers the workflow, which
+  bumps again — requiring `[skip ci]` or reliance on GitHub's invisible
+  protection that `GITHUB_TOKEN` pushes do not trigger workflows.
+- It leaves automated commits interleaved through the history.
+
+### Option B — version lives in git tags (chosen)
+
+The pom holds a placeholder, `<version>${revision}</version>`, with a default of
+`0.0.0-SNAPSHOT`. The pipeline reads the latest tag with
+`git describe --tags --abbrev=0`, increments the patch component, passes the
+result into the build as `--build-arg REVISION`, and tags the commit on success.
+
+**Everything above is resolved.** The pom is never modified, so the dependency
+layer stays stable and the cache holds. No write to the branch, so no bypass and
+no loop. No automated commits.
+
+**What it costs:**
+
+- The pom no longer states the real version. A developer building locally without
+  `-Drevision` gets `0.0.0-SNAPSHOT`, which is honest but not obvious.
+- `fetch-depth: 0` is required on checkout, since a shallow clone carries no tags.
+- Publishing to a Maven repository would require `flatten-maven-plugin`, so that
+  consumers do not receive a pom containing an unresolved placeholder. Not
+  relevant here, since the artifact is a Docker image.
+
+### Why the switch happened mid-implementation
+
+The caching penalty was not visible when the decision was first made. It appeared
+while writing the pipeline, tracing why the `COPY` split — carefully designed for
+exactly this purpose — was not helping in CI. That turned an argument about
+presentation into three measurable advantages against one, which is a different
+question from the one originally answered.
+
+
 ---
 
 ## 2. Understanding the Repository
@@ -612,6 +672,8 @@ should return a size of 250 MB
 
 Create a ci.yml file.
 
+[ci.yml](/maven-hello-world/.github/workflows/ci.yml)
+
 ```bash
 cd ~/github/maven-hello-world
 mkdir -p .github/workflows
@@ -624,10 +686,90 @@ touch ci.yml
 **trigger :** The pipline will triger only on push to the main branch and on manual dispatch.
 
 
-**permissions :** this pipline gets permissions of write to the repo, it need to push back the updated pom.xml file after the version bump. also by declaring the permissions here we can implment POLP by giving a specific scope to the pipline (all the other premissions are none).
+**permissions :** this pipline gets permissions of write to the repo, it need to push back the the new tag. also by declaring the permissions here we can implment POLP by giving a specific scope to the pipline (all the other premissions are none).
 
-### Environment Setup
+### Checkout
 
  - runs-on - settings the VM OS to ubuntu 22.04, usuing a specific version and not latest to ensure consistency
- - Checkout - uses the action : `actions/checkout@v4` which clones the repo to the runner
- - Set up JDK 17 - uses the action `actions/setup-java@v4` and explicetly declere java-version 17, temurin distribution (the same version we use to built the image), using the 
+ - Checkout - uses the action : `actions/checkout@v4` which clones the repo to the runner, with `fetch-depth: 0` which return all of the repo history, not a big problem when usuing a small or medium repo but can be very slow when usuing a large repo.
+ we need the whole history in order to find the latest tag, if we use the `fetch-depth: 1` we will get only the latest commit which dosent include any git tags
+
+### Determine next version
+
+ - `LATEST=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")` - gets the tag that is closest to the HEAD in the repo history, `--abbrev=0` give us the tag only without the SHA
+ - `2>/dev/null || echo "v0.0.0"` - the safty net, in case there is no tag the error is moved to dev/null and tag used is `v0.0.0` 
+ - `CURRENT=${LATEST#v}` - delete the v at the start of the tag
+```bash
+MAJOR=$(echo "$CURRENT" | cut -d. -f1)
+MINOR=$(echo "$CURRENT" | cut -d. -f2)
+PATCH=$(echo "$CURRENT" | cut -d. -f3)
+ ```
+break the tag into 3 diffrent varibels usuing `-d.` as a delimiter and asking for the apropriate number with `-f1`
+
+ - `NEW="$MAJOR.$MINOR.$((PATCH + 1))"` - Creating a new version by updating the patch number and save it to a varibale named NEW
+
+- `echo "version=$NEW" >> "$GITHUB_OUTPUT"` write the varibale to `$GITHUB_OUTPUT` which is an env varibale that contins a path to temp file that at the end of this step will save all of its data as the output of this setp id
+
+- `echo "Latest tag: $LATEST -> new version: $NEW"` - logging the changes
+
+**Known limitation:** this assumes tags are strictly `vX.Y.Z`. A tag like `v1.0`
+leaves `PATCH` empty and the arithmetic fails. Tags are created by the pipeline
+so the format is guaranteed in practice, but a hand-created tag in another format
+would break the next run.
+
+### Buildx
+
+Use the docker/setup-buildx-action@v3 to install buildx, the main reason for using buildx is
+that it creates a `docker-container` builder, which can export and import its layer cache.
+Docker already uses BuildKit by default, but the built-in `docker:default` builder cannot do
+that — so without this step `cache-to` and `cache-from` fail and every CI run rebuilds from
+scratch, making the layer ordering in the Dockerfile worthless in the pipeline.
+
+### Docker login
+
+Use the docker/login-action@v3 to allow communication with docker hub, inject the user name and password from github vars/sercrets (i have enterd those value at step "3 Setup"), it preform a docker login and write the credentials to `~/docker/.config.json`. 
+
+### Build and push
+
+uses the docker/build-push-action@v6 with the follwing arguments
+- push: `false` - after the image is built dont push it to the registry 
+- load: `true` - import the image from the builder continer to the docker daemon
+- build-args: `REVISION=${{ steps.version.outputs.version }}` the given build args to the build command, uses the version we created at the Determine next version phase
+- tags: `${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:${{ steps.version.outputs.version }}` - tags the image with the correct version, same as above we got the version from the Determine next version phase
+- `${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:latest` a second tag named latest as asked in the exercise
+- cache-from: `type=gha` use the cache that is stored at git hub action cache a service that allows to store data outside the VM and call it for futere use, this is what makes our build faster with the usage of caching
+- cache-to: `type=gha,mode=max` - where to cache the data, its the othe side of the same coin, the `mode=max` arg tells github to store layers that are not present in the final image 
+
+### Smoke test
+
+decided to make two checks before uploading the image and the artifact, this check are relvent to the code i wrote in the docker file and not the code the developer wrote
+
+**entrypoint check** - make sure the entry point in the docker file works and dosent return a status code diffrent the 0. it works because github action runs each script with the set -e command which drops the whole pipline if an exit code return a diffrent value then 0
+`docker run --rm "$IMAGE"`
+
+```bash
+OUTPUT=$(docker run --rm "$IMAGE")
+echo "Output: $OUTPUT"
+echo "$OUTPUT" | grep -q "Hello World from Noam" || {
+echo "::error::unexpected output"; exit 1; }
+```
+
+**non root user** - run the continer and ask for the user id back, ensure the user is not root
+
+```bash
+RUN_UID=$(docker run --rm --entrypoint id -u "$IMAGE")
+echo "Running as UID: $RUN_UID"
+[ "$RUN_UID" != "0" ] || {
+  echo "::error::container runs as root"; exit 1; }
+```
+
+### Extract jar from image
+
+- `IMAGE="${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:${{ steps.version.outputs.version }}"` - save the image name as a varibale named IMAGE, 
+- `docker pull "$IMAGE"` - pull the image from docker hub, needed becuase in the last stage we used Buildx for its caching capabilities, but it dosent use the local docker daemon when the image is built, it builds the image inside a continer and then push it to the registry, which means we need to download the image back to extract the jar
+
+### Upload jar artifact
+
+### Push to Docker hub
+
+### Pull and run

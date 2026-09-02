@@ -9,6 +9,7 @@ RUN mvn -B -e dependency:go-offline
 
 # Sources change often; keep them in a later layer
 COPY myapp/src ./src
+# Takes a argument from the build command to pass as the jar version
 ARG REVISION=0.0.0-SNAPSHOT
 RUN mvn -B package -Drevision=${REVISION}
 

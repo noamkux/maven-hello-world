@@ -9,7 +9,8 @@ RUN mvn -B -e dependency:go-offline
 
 # Sources change often; keep them in a later layer
 COPY myapp/src ./src
-RUN mvn -B package
+ARG REVISION=0.0.0-SNAPSHOT
+RUN mvn -B package -Drevision=${REVISION}
 
 # Runtime stage
 FROM eclipse-temurin:17.0.13_11-jre-alpine

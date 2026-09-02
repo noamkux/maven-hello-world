@@ -1,7 +1,7 @@
 # maven-hello-world — CI/CD Pipeline
 
 A Java/Maven "Hello World" application with a fully automated GitHub Actions
-pipeline: automatic patch version bumping, multistage Docker build, non-root
+pipeline: git-tag-driven patch versioning, multistage Docker build, non-root
 runtime, Docker Hub publishing, and Kubernetes deployment via Helm.
 
 Forked from ido83/maven-hello-world - https://github.com/ido83/maven-hello-world
@@ -19,14 +19,15 @@ Forked from ido83/maven-hello-world - https://github.com/ido83/maven-hello-world
 
 ### Pipeline flow
 
+
 ```
-push to master
+merge PR to main
       |
       v
-  bump patch version in pom.xml  ->  commit back [skip ci]
+  read latest git tag  ->  compute next patch version
       |
       v
-  multistage docker build  (compile + test + package inside the image)
+  multistage docker build  (version injected as --build-arg)
       |
       +--> extract jar from image  ->  upload as build artifact
       |
@@ -35,7 +36,13 @@ push to master
       |
       v
   pull the pushed image and run it
+      |
+      v
+  tag the commit  (v1.0.1)
 ```
+The tag is created last, after the image has been built, published, pulled and
+run. A failure anywhere earlier leaves no tag, so the version sequence has no
+gaps for builds that never produced an image.
 
 ---
 
@@ -371,8 +378,8 @@ have added an authentication step in both places for no benefit here.
 
 ### Credentials — secrets vs. variables
 
-A docker personal access token was created to allow git lab to push a image
-to the repo, after the token is issued save it in git lab as a secret.
+A docker personal access token was created to allow git hub to push a image
+to the repo, after the token is issued save it in git hub as a secret.
 
 The username is deliberately **not** a secret. GitHub masks secret values in
 logs, so storing the username as one would render every image reference in the
@@ -390,19 +397,45 @@ individually without touching the account.
 Repository **Settings → Actions → General → Workflow permissions** is set to
 **Read and write**, and the workflow additionally declares:
 
-## 4. Code Changes
-
-### Update the pom.xml file
-
-1. Change the version field in the pom.xml file, currently it states `<version>1.0-SNAPSHOT</version>`,
-which is used for an applications which is still in development, change it usuing the commadn
-```bash
-cd ~/github/maven-hello-world/myapp
-mvn versions:set -DnewVersion=1.0.0 -DgenerateBackupPoms=false
+```yaml
+permissions:
+  contents: write
 ```
 
-`-DgenerateBackupPoms=false` - by defualt maven create a backup of the pom file in evrey chngae
-not nessecry here
+This is required so the pipeline can push the release tag
+
+
+## 4. Code Changes
+
+### Update the pom.xml
+
+**1. Replace the hard-coded version with a placeholder.**
+
+The fork ships as `<version>1.0-SNAPSHOT</version>`. In Maven, the `-SNAPSHOT`
+suffix marks a version as still in development: Maven re-checks remote
+repositories for a newer copy, whereas a release version is fetched once and
+cached permanently. An automatic patch bump has no meaning on top of a SNAPSHOT.
+
+Rather than writing a fixed version into the file, the project uses Maven's
+**CI-Friendly Versions** mechanism:
+
+```xml
+<version>${revision}</version>
+
+<properties>
+  <revision>0.0.0-SNAPSHOT</revision>
+</properties>
+```
+
+`${revision}` is one a reserved property names that Maven 3.5+ permits inside `<version>`. 
+
+The real version is injected at build time:
+
+```bash
+mvn -B package -Drevision=1.0.1
+```
+
+and the default value keeps a local build without flags working.
 
 2. Change the following lines in the pom.xml file, this will make the compiler run as a JDK 17 version.
 using the source and target attributes in the pom file will enforce the usage of an allowed syntax in a specific
@@ -436,10 +469,11 @@ Add my name to the App.java file as requested in the assigment
 ## 5 Local Build
 
 Built the `.jar` file locally to check the app is built and runs correctliy
-Use the folwwing command to built, the -B flag runs the comand in batch mode 
+Use the follwing command to built, the -B flag runs the comand in batch mode 
 which dosent ask for input from the user
+
 ```bash
-mvn -B clean package
+mvn -B clean package -Drevision=1.0.0
 ```
 Check the name of the `.jar` file is as follow : `myapp-1.0.0.jar`
 Use the follwing command to run the .jar file
@@ -476,8 +510,12 @@ This will allow downloading all the needed dependencies to a cache layer and imp
 Copy the source code, this separation is what makes the caching of the dependencies valuable,
 because this layer can change frequently
 
-`RUN mvn -B package`       
-Use maven to package the app, maven will run until the package phase in the default lifecycle
+`ARG REVISION=0.0.0-SNAPSHOT`
+Declare a varibale name `REVISION` with a default value of `0.0.0-SNAPSHOT`    
+this is how we transfar the version into the image from git tag.
+
+`RUN mvn -B package -Drevision=${REVISION}`       
+Use maven to package the app, maven will run until the package phase in the default lifecycle, use the Drevision flag to add the current build number
 
 `FROM eclipse-temurin:17.0.13_11-jre-alpine`      
 The start of a new stage using the JRE Alpine image. This image will be the
@@ -514,20 +552,20 @@ Create a .dockerignore file with the follwing :
 
 ### Testing the Dockerfile
 
-1. cache test
+**cache test**
 
 run the follwing command 
 
 ```bash
-docker build -t maven-hello-world:1.0.0 .
+docker build --build-arg REVISION=1.0.0 -t maven-hello-world:1.0.0 .
 ```
 this command will build the image, it should take a few mintues for the first time    
 now run the same command again, the build should be much faster because of the caching we did in the docker file
-
-2. Change only to the source code
+***
+**Change only to the source code**
 
 change the value the program prints, and see if the image is built correctly, the only layers
-that should rebuilt is the source code and the pom and the dependencies
+that should rebuilt is the source code, the pom and the dependencies should remain cached
 
 ```bash
 => CACHED [build 3/6] COPY myapp/pom.xml .
@@ -535,8 +573,25 @@ that should rebuilt is the source code and the pom and the dependencies
 => [build 5/6] COPY myapp/src ./src 
 => [build 6/6] RUN mvn -B clean package 
  ```
+***
+**Change only the version**
 
-3. Check the running user inside the continer is not root
+This is the test that justifies where the `ARG` sits.
+
+```bash
+docker build --build-arg REVISION=1.0.1 -t maven-hello-world:1.0.1 .
+```
+
+In this test we check that a bump in the version dosent run all the depnedencies again, you will need to get the follwing output
+
+```
+=> CACHED [build 3/6] COPY myapp/pom.xml .
+=> CACHED [build 4/6] RUN mvn -B -e dependency:go-offline
+=> CACHED [build 5/6] COPY myapp/src ./src
+=> [build 6/6] RUN mvn -B package -Drevision=${REVISION}
+```
+***
+**Check the running user inside the continer is not root**
 
 ```bash
 docker run --rm --entrypoint id maven-hello-world:1.0.0
@@ -544,8 +599,8 @@ docker run --rm --entrypoint id maven-hello-world:1.0.0
 ```bash
 uid=100(app) gid=101(app) groups=101(app)
 ```
-
-4. Check the image size
+***
+**Check the image size**
 
 ```
 docker images maven-hello-world:1.0.0
@@ -564,3 +619,15 @@ cd .github/workflows
 touch ci.yml
 ```
 
+### Trigger & Permissions
+
+**trigger :** The pipline will triger only on push to the main branch and on manual dispatch.
+
+
+**permissions :** this pipline gets permissions of write to the repo, it need to push back the updated pom.xml file after the version bump. also by declaring the permissions here we can implment POLP by giving a specific scope to the pipline (all the other premissions are none).
+
+### Environment Setup
+
+ - runs-on - settings the VM OS to ubuntu 22.04, usuing a specific version and not latest to ensure consistency
+ - Checkout - uses the action : `actions/checkout@v4` which clones the repo to the runner
+ - Set up JDK 17 - uses the action `actions/setup-java@v4` and explicetly declere java-version 17, temurin distribution (the same version we use to built the image), using the 

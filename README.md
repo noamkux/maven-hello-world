@@ -453,70 +453,64 @@ Check you get back the string `Hello World from Noam!`
 ### Wrting the Dockerfile
 
 Create a Dockerfile in the root of the maven-hello-world folder.
-Wrtie the Follwiong in the Docker file :
 
-```Dockerfile
-# Use an explicit maven version and name it as build for future multistage use
-FROM maven:3.9.9-eclipse-temurin-17 AS build
+[Docker file](./Dockerfile)
 
-# Create a workdir for the build named "build"
-WORKDIR /build
+`FROM maven:3.9.9-eclipse-temurin-17 AS build`     
+Use an explicit maven version and name it as build for future multistage use
 
-# Copy only the pom.xml file, this file doesn't change as often
-# so this layer and the run command won't rerun
-# in every build, this will improve the performance of the build.
-COPY myapp/pom.xml .
+`WORKDIR /build`      
+Create a workdir for the build named "build"
 
-# Use the -B flag to run in batch mode (no user input needed), -e shows the full error if there is any
-# dependency:go-offline uses the dependency plugin and sets the goal of go-offline.
-# This will allow downloading all the needed dependencies to a cache layer and improve the performance of the Dockerfile.
-RUN mvn -B -e dependency:go-offline
+`COPY myapp/pom.xml .`       
+Copy only the pom.xml file, this file doesn't change as often
+so this layer and the run command won't rerun
+in every build, this will improve the performance of the build.
 
-# Copy the source code, this separation is what makes the caching of the dependencies valuable,
-# because this layer can change frequently
-COPY myapp/src ./src
+`RUN mvn -B -e dependency:go-offline`      
+Use the -B flag to run in batch mode (no user input needed), -e shows the full error if there is any
+dependency:go-offline uses the dependency plugin and sets the goal of go-offline.
+This will allow downloading all the needed dependencies to a cache layer and improve the performance of the Dockerfile.
 
-# Use maven to package the app, maven will run until the package phase in the default lifecycle
-RUN mvn -B package
+`COPY myapp/src ./src`       
+Copy the source code, this separation is what makes the caching of the dependencies valuable,
+because this layer can change frequently
 
-# The start of a new stage using the JRE Alpine image. This image will be the
-# runtime image for the app
-FROM eclipse-temurin:17.0.13_11-jre-alpine
+`RUN mvn -B package`       
+Use maven to package the app, maven will run until the package phase in the default lifecycle
 
-# Create a non-root group and non-root user using the -S flag to create a system user/group.
-# This creates a user with a locked password, no home dir and a nologin shell
-RUN addgroup -S app && adduser -S -G app app
+`FROM eclipse-temurin:17.0.13_11-jre-alpine`      
+The start of a new stage using the JRE Alpine image. This image will be the
+runtime image for the app
 
-# Create a new workdir for the runtime
-WORKDIR /app
+`RUN addgroup -S app && adduser -S -G app app`      
+Create a non-root group and non-root user using the -S flag to create a system user/group.
+This creates a user with a locked password, no home dir and a nologin shell
 
-# Copy only the jar from the build stage, creating a smaller image and less attack surface
-COPY --from=build --chown=app:app /build/target/myapp-*.jar /app/app.jar
+`WORKDIR /app`      
+Create a new workdir for the runtime
 
-# Use the app user we created in the previous command
-USER app
+`COPY --from=build --chown=app:app /build/target/myapp-*.jar /app/app.jar`      
+Copy only the jar from the build stage, creating a smaller image and less attack surface
 
-# java - use the JVM launcher to run this app.
-# -XX:MaxRAMPercentage=75.0 - by default the JVM allows the program to use 25% of the container RAM for the heap.
-# In a situation of a single program that runs in a container this is a waste of memory, I have set the limit to
-# 75% to use as much RAM as I can and still leave RAM for the other parts of the JVM
-# -jar - tells the JVM to read the manifest and find there the Main-Class
-# /app/app.jar - the path of the jar file
-ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "-jar", "/app/app.jar"]
-```
+`USER app`      
+Use the app user we created in the previous command
+
+`ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "-jar", "/app/app.jar"]`      
+java - use the JVM launcher to run this app.
+-XX:MaxRAMPercentage=75.0 - by default the JVM allows the program to use 25% of the container RAM for the heap.
+In a situation of a single program that runs in a container this is a waste of memory, I have set the limit to
+75% to use as much RAM as I can and still leave RAM for the other parts of the JVM
+-jar - tells the JVM to read the manifest and find there the Main-Class
+/app/app.jar - the path of the jar file
+
+
 
 ### Writing the .dockerignore file
 
 Create a .dockerignore file with the follwing :
 
-```.dockerignore
-.git
-.github
-**/target
-README.md
-.gitignore
-.vscode
-```
+
 
 ### Testing the Dockerfile
 
@@ -557,4 +551,16 @@ uid=100(app) gid=101(app) groups=101(app)
 docker images maven-hello-world:1.0.0
 ```
 
-should return a size of 250 +/- MB
+should return a size of 250 MB
+
+## 7 Workflow
+
+Create a ci.yml file.
+
+```bash
+cd ~/github/maven-hello-world
+mkdir -p .github/workflows
+cd .github/workflows
+touch ci.yml
+```
+

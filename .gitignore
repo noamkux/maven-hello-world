@@ -1,3 +1,4 @@
 target/
 *.versionsBackup
 .vscode/
+example.yml

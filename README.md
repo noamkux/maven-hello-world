@@ -437,7 +437,7 @@ Add my name to the App.java file as requested in the assigment
 
 Built the `.jar` file locally to check the app is built and runs correctliy
 Use the folwwing command to built, the -B flag runs the comand in batch mode 
-which dosent show progress bar and soent dirty the screen
+which dosent ask for input from the user
 ```bash
 mvn -B clean package
 ```
@@ -447,3 +447,114 @@ Use the follwing command to run the .jar file
 java -jar myapp-1.0.0.jar
 ```
 Check you get back the string `Hello World from Noam!`
+
+## 6 Dockerfile
+
+### Wrting the Dockerfile
+
+Create a Dockerfile in the root of the maven-hello-world folder.
+Wrtie the Follwiong in the Docker file :
+
+```Dockerfile
+# Use an explicit maven version and name it as build for future multistage use
+FROM maven:3.9.9-eclipse-temurin-17 AS build
+
+# Create a workdir for the build named "build"
+WORKDIR /build
+
+# Copy only the pom.xml file, this file doesn't change as often
+# so this layer and the run command won't rerun
+# in every build, this will improve the performance of the build.
+COPY myapp/pom.xml .
+
+# Use the -B flag to run in batch mode (no user input needed), -e shows the full error if there is any
+# dependency:go-offline uses the dependency plugin and sets the goal of go-offline.
+# This will allow downloading all the needed dependencies to a cache layer and improve the performance of the Dockerfile.
+RUN mvn -B -e dependency:go-offline
+
+# Copy the source code, this separation is what makes the caching of the dependencies valuable,
+# because this layer can change frequently
+COPY myapp/src ./src
+
+# Use maven to package the app, maven will run until the package phase in the default lifecycle
+RUN mvn -B package
+
+# The start of a new stage using the JRE Alpine image. This image will be the
+# runtime image for the app
+FROM eclipse-temurin:17.0.13_11-jre-alpine
+
+# Create a non-root group and non-root user using the -S flag to create a system user/group.
+# This creates a user with a locked password, no home dir and a nologin shell
+RUN addgroup -S app && adduser -S -G app app
+
+# Create a new workdir for the runtime
+WORKDIR /app
+
+# Copy only the jar from the build stage, creating a smaller image and less attack surface
+COPY --from=build --chown=app:app /build/target/myapp-*.jar /app/app.jar
+
+# Use the app user we created in the previous command
+USER app
+
+# java - use the JVM launcher to run this app.
+# -XX:MaxRAMPercentage=75.0 - by default the JVM allows the program to use 25% of the container RAM for the heap.
+# In a situation of a single program that runs in a container this is a waste of memory, I have set the limit to
+# 75% to use as much RAM as I can and still leave RAM for the other parts of the JVM
+# -jar - tells the JVM to read the manifest and find there the Main-Class
+# /app/app.jar - the path of the jar file
+ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "-jar", "/app/app.jar"]
+```
+
+### Writing the .dockerignore file
+
+Create a .dockerignore file with the follwing :
+
+```.dockerignore
+.git
+.github
+**/target
+README.md
+.gitignore
+.vscode
+```
+
+### Testing the Dockerfile
+
+1. cache test
+
+run the follwing command 
+
+```bash
+docker build -t maven-hello-world:1.0.0 .
+```
+this command will build the image, it should take a few mintues for the first time    
+now run the same command again, the build should be much faster because of the caching we did in the docker file
+
+2. Change only to the source code
+
+change the value the program prints, and see if the image is built correctly, the only layers
+that should rebuilt is the source code and the pom and the dependencies
+
+```bash
+=> CACHED [build 3/6] COPY myapp/pom.xml .
+=> CACHED [build 4/6] RUN mvn -B -e dependency:go-offline
+=> [build 5/6] COPY myapp/src ./src 
+=> [build 6/6] RUN mvn -B clean package 
+ ```
+
+3. Check the running user inside the continer is not root
+
+```bash
+docker run --rm --entrypoint id maven-hello-world:1.0.0
+```
+```bash
+uid=100(app) gid=101(app) groups=101(app)
+```
+
+4. Check the image size
+
+```
+docker images maven-hello-world:1.0.0
+```
+
+should return a size of 250 +/- MB

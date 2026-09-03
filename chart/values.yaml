@@ -1,0 +1,5 @@
+image:
+  repository: noamkux/maven-hello-world
+  # empty by default — the template falls back to .Chart.AppVersion
+  # override with: --set image.tag=x.y.z
+  tag: ""

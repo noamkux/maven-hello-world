@@ -766,6 +766,16 @@ echo "Running as UID: $RUN_UID"
 
 ### Upload jar artifact
 
+- `actions/upload-artifact@v4` upload an artifact to git hub, enable to download the artifact directly from github for inspection.
+
 ### Push to Docker hub
 
+use basic shell command to push the image to docker hub with the two tags, one with the jar version and one with latest.
+
 ### Pull and run
+
+- use `docker rmi docker rmi "$IMAGE" || true` delete the image if exsist in the local FS, ensure consistency for the testing.
+- `docekr pull "$IMAGE"` pull the newly created image from docker hub for testing
+
+- `OUTPUT=$(docker run --rm "$IMAGE")` - run the contianer and save the output to a varibale named OUTPUT to print to screen later
+- `echo "$OUTPUT"` - print the result of the docker run

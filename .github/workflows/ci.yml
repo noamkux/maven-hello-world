@@ -8,10 +8,6 @@ on:
 permissions:
     contents: write
 
-concurrency:
-    group: release
-    cancel-in-progress: false
-
 jobs:
     build:
         runs-on: ubuntu-22.04

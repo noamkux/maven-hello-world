@@ -93,3 +93,8 @@ jobs:
                   docker pull "$IMAGE"
                   OUTPUT=$(docker run --rm "$IMAGE")
                   echo "$OUTPUT"
+
+            - name: Tag the release
+              run: |
+                  git tag "v${{ steps.version.outputs.version }}"
+                  git push origin "v${{ steps.version.outputs.version }}"

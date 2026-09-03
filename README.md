@@ -762,6 +762,8 @@ fields are numbered from 1.
 
 - `NEW="$MAJOR.$MINOR.$((PATCH + 1))"` — increments the patch. `$(( ))` is bash
   arithmetic, distinct from `$( )` which runs a command.
+- `sed -i "s/^appVersion:.*/appVersion: \"$NEW\"/" ../chart/Chart.yaml` - 
+  update the version to the helm chart, explaind in the helm section.
 - `mvn -B versions:set -DnewVersion="$NEW" -DgenerateBackupPoms=false` — writes
   the new version into the pom on the runner. The Docker build that follows picks
   it up automatically, since `COPY myapp/pom.xml` copies the modified file.
@@ -844,7 +846,7 @@ The last step, so a failure anywhere earlier leaves the repository untouched.
 ```bash
 git config user.name "github-actions[bot]"
 git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-git add myapp/pom.xml
+git add myapp/pom.xml chart/Chart.yaml
 git commit -m "chore: bump version to <version> [skip ci]"
 git tag "v<version>"
 git push origin HEAD:main
@@ -853,8 +855,7 @@ git push origin "v<version>"
 
 - The email with the numeric prefix is the official user ID of
   `github-actions[bot]`; using it makes GitHub attribute the commit correctly.
-- `git add myapp/pom.xml` rather than `git add .` — the extracted jar is sitting
-  in the repository root at this point and has no business being committed.
+- `git add myapp/pom.xml chart/Chart.yaml` rather than `git add .` — adds the pom.xml file and the Chart.yaml file to the commit because thy are the only one that have been changed.
 - `[skip ci]` breaks the trigger loop. It is technically redundant, since commits
   pushed with the default `GITHUB_TOKEN` do not trigger workflows — but that
   protection is invisible in the file and disappears the moment someone swaps in a
@@ -862,3 +863,49 @@ git push origin "v<version>"
   something.
 - `git push origin HEAD:main` rather than `git push` — the Actions checkout is in
   detached HEAD state, so the target must be named explicitly.
+
+
+## 8 Helm chart
+
+### workload
+I have used a workload of job becuase this program dosent run in a infinite loop, if i will used deployment Kubernetes will restart the continer after the program exists (Deployment restartPolicy have to be always) eventually this will caused a CrashLoopBackOff. 
+
+### Choosing which version to deploy
+
+The version is set as `appVersion` in `Chart.yaml`, and `values.yaml` holds an
+empty `image.tag`. The template uses the tag when one is given and falls back to
+`appVersion` when it isn't:
+
+```yaml
+image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+```
+
+Deploy the version the chart is built around:
+
+```bash
+helm install hello ./chart
+```
+
+Deploy any other published version, without editing a file:
+
+```bash
+helm install hello ./chart --set image.tag=1.0.7
+```
+
+`--set` sits at the top of Helm's value precedence, so it overrides both
+`values.yaml` and the `appVersion` fallback.
+
+
+Both mechanisms are kept on purpose. Without `appVersion`, `helm install ./chart`
+with no flags would have no version to deploy at all; without `--set`, deploying a
+different one would mean editing, committing and merging a file. Together the
+chart has a sensible default that is recorded in git, and an escape hatch for
+everything else.
+
+The pipeline updates `appVersion` alongside the pom version on every release, so
+the chart's default always points at the most recent published image rather than
+drifting behind it.
+- Updating the chart is possible by taking the new app version and adding it to the Chart.yaml file           
+`sed -i "s/^appVersion:.*/appVersion: \"$NEW\"/" ../chart/Chart.yaml`        
+- Then the change is commited to git with the pom.xml file       
+`git add myapp/pom.xml chart/Chart.yaml`

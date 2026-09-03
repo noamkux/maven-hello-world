@@ -39,6 +39,7 @@ jobs:
                   PATCH=$(echo "$CURRENT" | cut -d. -f3)
                   NEW="$MAJOR.$MINOR.$((PATCH + 1))"
                   mvn -B versions:set -DnewVersion="$NEW" -DgenerateBackupPoms=false
+                  sed -i "s/^appVersion:.*/appVersion: \"$NEW\"/" ../chart/Chart.yaml
                   echo "version=$NEW" >> "$GITHUB_OUTPUT"
                   echo "Bumped $CURRENT -> $NEW"
 
@@ -108,7 +109,7 @@ jobs:
               run: |
                   git config user.name "github-actions[bot]"
                   git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-                  git add myapp/pom.xml
+                  git add myapp/pom.xml chart/Chart.yaml
                   git commit -m "chore: bump version to ${{ steps.version.outputs.version }} [skip ci]"
                   git tag "v${{ steps.version.outputs.version }}"
                   git push origin HEAD:main

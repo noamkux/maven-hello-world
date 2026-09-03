@@ -80,3 +80,16 @@ jobs:
                   name: myapp-${{ steps.version.outputs.version }}
                   path: ./myapp-${{ steps.version.outputs.version }}.jar
                   if-no-files-found: error
+
+            - name: Push to DockerHub
+              run: |
+                  docker push "${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:${{ steps.version.outputs.version }}"
+                  docker push "${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:latest"
+
+            - name: Pull from DockerHub
+              run: |
+                  IMAGE="${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:${{ steps.version.outputs.version }}"
+                  docker rmi "$IMAGE" || true
+                  docker pull "$IMAGE"
+                  OUTPUT=$(docker run --rm "$IMAGE")
+                  echo "$OUTPUT"

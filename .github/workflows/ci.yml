@@ -73,3 +73,10 @@ jobs:
                   docker cp "$CID:/app/app.jar" "./myapp-${{ steps.version.outputs.version }}.jar"
                   docker rm "$CID"
                   ls -lh ./myapp-*.jar
+
+            - name: Upload jar artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: myapp-${{ steps.version.outputs.version }}
+                  path: ./myapp-${{ steps.version.outputs.version }}.jar
+                  if-no-files-found: error

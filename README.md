@@ -53,7 +53,7 @@ image.
 Two approaches were implemented during this project. The second replaced the
 first, and was then reverted after a review raised a problem it did not solve.
 
-**The requirement.** Task 5.2 sets the jar version to `1.0.0`; task 6.1
+**The requirement.** Task 5.2 sets the jar version to `1.0.0`, task 6.1
 increases the patch part of *that* version automatically. They are one
 requirement in two steps: a number that lives in the project and moves.
 
@@ -250,7 +250,7 @@ the convention can still be built, but you will be fighting the tool.
 
 **The three kinds of repository**
 
-- **Local** — the `~/.m2` directory on your machine. A cache; Maven looks here
+- **Local** — the `~/.m2` directory on your machine. A cache, Maven looks here
   first.
 - **Central** — Apache's public repository. Anything not found locally comes
   from here.
@@ -313,7 +313,7 @@ before a build. If you want you ask for both in one command — which is why
 **Three concepts**
 
 - **Phase** — a station in the sequence, such as `compile` or `package`. A phase
-  does nothing by itself; it is a point in time.
+  does nothing by itself, it is a point in time.
 - **Goal** — a concrete action performed by a plugin, such as "compile the
   sources" or "create the jar".
 - **Binding** — the attachment between them: when you reach this phase, run this
@@ -335,7 +335,7 @@ purpose.
 - **validate** — checks the project structure and that required information is
   present. Fast, and designed to fail early on anything fundamentally broken.
 - **compile** — compiles production code from `src/main/java` into bytecode in
-  `target/classes`. Test code is *not* compiled here; it has its own phase.
+  `target/classes`. Test code is *not* compiled here, it has its own phase.
 - **test** — runs unit tests, after compiling test sources separately into
   `target/test-classes`. This is the critical failure point: if a test fails the
   build stops, no jar is produced, and the pipeline fails. That is intentional —
@@ -343,16 +343,16 @@ purpose.
 - **package** — takes the bytecode and packages it into the distribution format,
   here a jar, named from the artifactId and version.
 - **verify** — runs integration tests and quality checks against the packaged
-  artifact. Unit tests check an isolated component; this checks the finished
+  artifact. Unit tests check an isolated component, this checks the finished
   product. Empty in a simple project, but this is where security scans and
   coverage gates belong in a serious pipeline.
 - **install** — copies the jar into the local repository at `~/.m2`, so another
-  project on the same machine can depend on it. That is its only purpose; it
+  project on the same machine can depend on it. That is its only purpose, it
   does not install anything into a real environment.
 - **deploy** — uploads the jar to a remote repository, making it available
   across the organization.
 
-**package vs install vs deploy.** All three produce the jar; the difference is
+**package vs install vs deploy.** All three produce the jar, the difference is
 where it ends up. `package` leaves it in `target/`, usable by this project only.
 `install` also copies it to the local `~/.m2`, usable by other projects on that
 machine. `deploy` also uploads it to a remote repository, usable by everyone.
@@ -375,7 +375,7 @@ These names are worth knowing: when a build fails, the failing plugin's name
 appears in the log, which tells you immediately which phase you fell over in.
 
 **Surefire vs Failsafe.** Surefire runs at the `test` phase, before packaging,
-and executes unit tests; a failure stops everything immediately. Failsafe runs
+and executes unit tests, a failure stops everything immediately. Failsafe runs
 after packaging and executes integration tests, and is deliberately designed
 *not* to fail immediately — it records the failure and continues, so that a
 cleanup step (shutting down a test server, deleting test data) can run before
@@ -468,7 +468,7 @@ cd maven-hello-world
 A public repository at noamkux/maven-hello-world.
 
 Public was a deliberate choice, for two reasons: the pipeline's final step pulls
-and runs the image, which needs no authentication when the repository is public;
+and runs the image, which needs no authentication when the repository is public,
 and the Helm deployment needs no `imagePullSecret`. A private repository would
 have added an authentication step in both places for no benefit here.
 
@@ -672,7 +672,7 @@ finish in seconds, with every step reported as `CACHED`.
 **Change only to the source code**
 
 Change the string the program prints and rebuild. Only the source and package
-layers rerun; the pom and dependency layers stay cached.
+layers rerun, the pom and dependency layers stay cached.
 
 ```
 => CACHED [build 3/6] COPY myapp/pom.xml .
@@ -812,7 +812,7 @@ decided to make two checks before uploading the image and the artifact, this che
 RUN_UID=$(docker run --rm --entrypoint id "$IMAGE" -u)
 echo "Running as UID: $RUN_UID"
 [ "$RUN_UID" != "0" ] || {
-  echo "::error::container runs as root"; exit 1; }
+  echo "::error::container runs as root", exit 1, }
 ```
 
 ### Extract jar from image
@@ -854,7 +854,7 @@ git push origin "v<version>"
 ```
 
 - The email with the numeric prefix is the official user ID of
-  `github-actions[bot]`; using it makes GitHub attribute the commit correctly.
+  `github-actions[bot]`, using it makes GitHub attribute the commit correctly.
 - `git add myapp/pom.xml chart/Chart.yaml` rather than `git add .` — adds the pom.xml file and the Chart.yaml file to the commit because thy are the only one that have been changed.
 - `[skip ci]` breaks the trigger loop. It is technically redundant, since commits
   pushed with the default `GITHUB_TOKEN` do not trigger workflows — but that
@@ -868,7 +868,7 @@ git push origin "v<version>"
 ## 8 Helm chart
 
 ### workload
-I have used a workload of job becuase this program dosent run in a infinite loop, if i will used deployment Kubernetes will restart the continer after the program exists (Deployment restartPolicy have to be always) eventually this will caused a CrashLoopBackOff. 
+I have used a job workload becuase this program dosent run in a infinite loop, if i will used deployment Kubernetes will restart the continer after the program exists (Deployment restartPolicy have to be always) eventually this will caused a CrashLoopBackOff. 
 
 ### Choosing which version to deploy
 
@@ -897,15 +897,48 @@ helm install hello ./chart --set image.tag=1.0.7
 
 
 Both mechanisms are kept on purpose. Without `appVersion`, `helm install ./chart`
-with no flags would have no version to deploy at all; without `--set`, deploying a
+with no flags would have no version to deploy at all, without `--set`, deploying a
 different one would mean editing, committing and merging a file. Together the
 chart has a sensible default that is recorded in git, and an escape hatch for
 everything else.
 
+### Chart version bump
+
 The pipeline updates `appVersion` alongside the pom version on every release, so
 the chart's default always points at the most recent published image rather than
 drifting behind it.
-- Updating the chart is possible by taking the new app version and adding it to the Chart.yaml file           
+- Updating the chart thru the pipline is possible by taking the new app version and adding it to the Chart.yaml file           
 `sed -i "s/^appVersion:.*/appVersion: \"$NEW\"/" ../chart/Chart.yaml`        
 - Then the change is commited to git with the pom.xml file       
 `git add myapp/pom.xml chart/Chart.yaml`
+
+### Folder structure
+
+- `chart/Chart.yaml` — the chart's metadata: name, description, and the two
+  versions it carries
+- `chart/values.yaml` — the values injected into the templates
+- `chart/templates/job.yaml` — the Job manifest that gets rendered and deployed
+
+### chart/Chart.yaml
+
+- `apiVersion: v2` - uses helm 3
+- `name: maven-hello-world` - the chart name
+- `description: Hello World Java app deployed as a Kubernetes Job` - the chart description
+- `type: application` - chart type
+- `version: 0.1.0` - the chart version, changes when we change the chart not the app.
+- `appVersion: "1.0.2"` - the app version that runs inside the cluster
+
+### chart/Values.yaml
+
+- `image: repository: noamkux/maven-hello-world` - points to the repo and image to be used
+- `tag: ""` - empty by default the template falls back to Chart.AppVersion 
+
+### chart/templates/job.yaml
+
+- `kind: Job` - uses a job workload the reason for that is explaind in the workload part
+- `name: {{ .Release.Name }}` - uses the name we gave in the install command as the name of the relase
+- `ttlSecondsAfterFinished: 300` - delete the job 300 seconds after the job is done
+- `restartPolicy: Never` - done try to reload the pod after the job has ended (the other optin is OnFailure and is not comptabile with the use case here)
+- `image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"`      
+{{ .Values.image.repository }} - uses the image.repostery name from the chart/Values.yaml file.         
+{{ .Values.image.tag | default .Chart.AppVersion }} - takes the version either from the --set command in the cli or the values.yaml file if nither xsist takes it from Chart.yaml

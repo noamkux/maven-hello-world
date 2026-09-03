@@ -509,9 +509,10 @@ blocked, deletions blocked. Required approvals is 0 — a single-contributor
 repository cannot satisfy a review requirement, and a rule that cannot be met is
 a rule that gets bypassed.
 
-`github-actions[bot]` is on the bypass list, because the pipeline commits the
-version bump to `main`. This is the cost of keeping the version in the pom: an
-automated release process needs write access to the branch it protects.
+to let the runner push to the repo (tags and the updated pom file) i have
+created a deploy key for the runner.
+the deploy key is allowd to push to repo in the ruleset, the key itself is saved as a secret
+in github and injected to the runner in the ci.yml file.
 
 ## 4. Code Changes
 

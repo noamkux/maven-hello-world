@@ -73,12 +73,3 @@ jobs:
                   docker cp "$CID:/app/app.jar" "./myapp-${{ steps.version.outputs.version }}.jar"
                   docker rm "$CID"
                   ls -lh ./myapp-*.jar
-
-              id: run
-              run: |
-                  IMAGE="${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:${{ steps.version.outputs.version }}"
-                  docker rmi "$IMAGE" || true
-                  docker pull "$IMAGE"
-                  OUTPUT=$(docker run --rm "$IMAGE")
-                  echo "$OUTPUT"
-                  echo "output=$OUTPUT" >> "$GITHUB_OUTPUT"

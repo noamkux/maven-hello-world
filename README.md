@@ -542,16 +542,6 @@ java version and add the proper label to the byte code, but doesn't enforce buil
 changing these to the release attribute also enforces the API of the declared version, so code cannot compile
 against a method that doesn't exist in it.
 
-from :
-```XML
-<maven.compiler.source>1.7</maven.compiler.source>
-<maven.compiler.target>1.7</maven.compiler.target>
-```
-
-to :
-```XML
-<maven.compiler.release>17</maven.compiler.release>
-```
 
 ### .gitignore
 

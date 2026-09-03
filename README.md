@@ -779,3 +779,11 @@ use basic shell command to push the image to docker hub with the two tags, one w
 
 - `OUTPUT=$(docker run --rm "$IMAGE")` - run the contianer and save the output to a varibale named OUTPUT to print to screen later
 - `echo "$OUTPUT"` - print the result of the docker run
+
+### Tag the release 
+
+run shell command to create a new git tag and push it to the repo
+
+- `git tag "v${{ steps.version.outputs.version }}"` - create a git tag with the name version created at the "Determine next version" phase
+
+- `git push origin "v${{ steps.version.outputs.version }}"` - push the new git tag

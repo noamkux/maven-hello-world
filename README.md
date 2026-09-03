@@ -11,11 +11,11 @@ Forked from ido83/maven-hello-world - https://github.com/ido83/maven-hello-world
 ## 1. Overview
 
 
- **Language** - Java 17 
- **Build tool** - Apache Maven 
- **CI/CD** - GitHub Actions 
- **Registry** - Docker Hub — `noamkux/maven-hello-world` 
- **Orchestration** - Kubernetes via Helm 
+ **Language** - Java 17       
+ **Build tool** - Apache Maven        
+ **CI/CD** - GitHub Actions        
+ **Registry** - Docker Hub — `noamkux/maven-hello-world`        
+ **Orchestration** - Kubernetes via Helm        
 
 ### Pipeline flow
 
@@ -172,8 +172,7 @@ terminated from outside.
 
 The fix is `-XX:+UseContainerSupport`, added in Java 10,
 which makes the JVM read the cgroup limit instead. It is on by default in modern
-JVMs, but the heap fraction still deserves to be explicit — this project sets
-`-XX:MaxRAMPercentage` rather than relying on defaults.
+JVMs, but the heap fraction still deserves to be explicit.
 
 
 
@@ -487,7 +486,7 @@ Rather than writing a fixed version into the file, the project uses Maven's
 </properties>
 ```
 
-`${revision}` is one a reserved property names that Maven 3.5+ permits inside `<version>`. 
+`${revision}` is a reserved property names that Maven 3.5+ permits inside `<version>`. 
 
 The real version is injected at build time:
 
@@ -708,7 +707,7 @@ break the tag into 3 diffrent varibels usuing `-d.` as a delimiter and asking fo
 
  - `NEW="$MAJOR.$MINOR.$((PATCH + 1))"` - Creating a new version by updating the patch number and save it to a varibale named NEW
 
-- `echo "version=$NEW" >> "$GITHUB_OUTPUT"` write the varibale to `$GITHUB_OUTPUT` which is an env varibale that contins a path to temp file that at the end of this step will save all of its data as the output of this setp id
+- `echo "version=$NEW" >> "$GITHUB_OUTPUT"` write the varibale to `$GITHUB_OUTPUT` which is an env varibale that contins a path to temp file, this file will save all of its data as the output of this setp id, thats how we can move data betwen steps
 
 - `echo "Latest tag: $LATEST -> new version: $NEW"` - logging the changes
 
@@ -732,13 +731,13 @@ Use the docker/login-action@v3 to allow communication with docker hub, inject th
 ### Build and push
 
 uses the docker/build-push-action@v6 with the follwing arguments
-- push: `false` - after the image is built dont push it to the registry 
+- push: `false` - after the image is built dont push it to the registry, we want to test first and the push
 - load: `true` - import the image from the builder continer to the docker daemon
 - build-args: `REVISION=${{ steps.version.outputs.version }}` the given build args to the build command, uses the version we created at the Determine next version phase
 - tags: `${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:${{ steps.version.outputs.version }}` - tags the image with the correct version, same as above we got the version from the Determine next version phase
-- `${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:latest` a second tag named latest as asked in the exercise
+- `${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:latest` a second tag named latest.
 - cache-from: `type=gha` use the cache that is stored at git hub action cache a service that allows to store data outside the VM and call it for futere use, this is what makes our build faster with the usage of caching
-- cache-to: `type=gha,mode=max` - where to cache the data, its the othe side of the same coin, the `mode=max` arg tells github to store layers that are not present in the final image 
+- cache-to: `type=gha,mode=max` - where to cache the data, its the other side of the same coin, the `mode=max` arg tells github to store layers that are not present in the final image 
 
 ### Smoke test
 
@@ -747,12 +746,6 @@ decided to make two checks before uploading the image and the artifact, this che
 **entrypoint check** - make sure the entry point in the docker file works and dosent return a status code diffrent the 0. it works because github action runs each script with the set -e command which drops the whole pipline if an exit code return a diffrent value then 0
 `docker run --rm "$IMAGE"`
 
-```bash
-OUTPUT=$(docker run --rm "$IMAGE")
-echo "Output: $OUTPUT"
-echo "$OUTPUT" | grep -q "Hello World from Noam" || {
-echo "::error::unexpected output"; exit 1; }
-```
 
 **non root user** - run the continer and ask for the user id back, ensure the user is not root
 
@@ -766,7 +759,10 @@ echo "Running as UID: $RUN_UID"
 ### Extract jar from image
 
 - `IMAGE="${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:${{ steps.version.outputs.version }}"` - save the image name as a varibale named IMAGE, 
-- `docker pull "$IMAGE"` - pull the image from docker hub, needed becuase in the last stage we used Buildx for its caching capabilities, but it dosent use the local docker daemon when the image is built, it builds the image inside a continer and then push it to the registry, which means we need to download the image back to extract the jar
+- `docker create "$IMAGE"` - uses the same image we just build and create a continar with this image, use docker create and not run because we dont need to run the continar we only need to acsses its FS to grab the jar file
+- `docker cp "$CID:/app/app.jar" "./myapp-${{ steps.version.outputs.version }}.jar"` - use docker cp to copy the image from the conatiner FS to the local FS of the runner
+- `docker rm "$CID"` - delete the container 
+- `ls -lh ./myapp-*.jar` to check the file is present
 
 ### Upload jar artifact
 

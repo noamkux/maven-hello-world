@@ -9,7 +9,7 @@ RUN mvn -B -e dependency:go-offline
 
 # Sources change often; keep them in a later layer
 COPY myapp/src ./src
-# Takes a argument from the build command to pass as the jar version
+# Takes a argument from the build command to pass as the jar version, default to 0.0.0-SNAPSHOT
 ARG REVISION=0.0.0-SNAPSHOT
 RUN mvn -B package -Drevision=${REVISION}
 
@@ -26,5 +26,3 @@ COPY --from=build --chown=app:app /build/target/myapp-*.jar /app/app.jar
 USER app
 
 ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "-jar", "/app/app.jar"]
-
-# why did i choose each version

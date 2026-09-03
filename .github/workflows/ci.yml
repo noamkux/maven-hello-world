@@ -61,7 +61,15 @@ jobs:
                   docker run --rm "$IMAGE"
 
                   echo "--- non-root check ---"
-                  RUN_UID=$(docker run --rm --entrypoint id -u "$IMAGE")
+                  RUN_UID=$(docker run --rm --entrypoint id "$IMAGE" -u)
                   echo "Running as UID: $RUN_UID"
                   [ "$RUN_UID" != "0" ] || {
                     echo "::error::container runs as root"; exit 1; }
+
+            - name: Extract jar from image
+              run: |
+                  IMAGE="${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:${{ steps.version.outputs.version }}"
+                  CID=$(docker create "$IMAGE")
+                  docker cp "$CID:/app/app.jar" "./myapp-${{ steps.version.outputs.version }}.jar"
+                  docker rm "$CID"
+                  ls -lh ./myapp-*.jar

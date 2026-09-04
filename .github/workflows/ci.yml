@@ -32,7 +32,7 @@ jobs:
               run: |
                   CURRENT=$(mvn -B -q help:evaluate -Dexpression=project.version -DforceStdout)
 
-                  [[ "$CURRENT" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || {
+                  [[ "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
                   echo "::error::unexpected version format: '$CURRENT' (expected X.Y.Z)"
                   exit 1; }
 
@@ -45,16 +45,19 @@ jobs:
 
             - name: Bump pom.xml file
               working-directory: myapp
-              run: |
-                  mvn -B versions:set -DnewVersion=${{ steps.version.outputs.new }} -DgenerateBackupPoms=false
-                  echo "Bumped ${{ steps.version.outputs.old }} -> ${{ steps.version.outputs.new }}"
-            - name: Bump helm chart
-              working-directory: myapp
               env:
-                  VERSION: ${{ steps.version.outputs.new }}
+                  OLD: ${{ steps.version.outputs.old }}
+                  NEW: ${{ steps.version.outputs.new }}
               run: |
-                  sed -i "s/^appVersion:.*/appVersion: \"$VERSION\"/" ../chart/Chart.yaml
-                  grep -q "^appVersion: \"$VERSION\"$" ../chart/Chart.yaml || {
+                  mvn -B versions:set -DnewVersion="$NEW" -DgenerateBackupPoms=false
+                  echo "Bumped $OLD -> $NEW"
+
+            - name: Bump helm chart
+              env:
+                  NEW: ${{ steps.version.outputs.new }}
+              run: |
+                  sed -i "s/^appVersion:.*/appVersion: \"$NEW\"/" chart/Chart.yaml
+                  grep -q "^appVersion: \"$NEW\"$" chart/Chart.yaml || {
                   echo "::error::failed to update appVersion in chart/Chart.yaml"
                   exit 1; }
 

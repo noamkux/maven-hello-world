@@ -3,4 +3,4 @@ name: maven-hello-world
 description: Hello World Java app deployed as a Kubernetes Job
 type: application
 version: 0.1.0
-appVersion: "1.0.6"
+appVersion: "1.0.7"

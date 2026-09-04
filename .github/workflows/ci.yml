@@ -10,6 +10,8 @@ permissions: {}
 jobs:
     build:
         runs-on: ubuntu-22.04
+        env:
+            REPO: ${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world
 
         steps:
             - name: Checkout
@@ -53,15 +55,15 @@ jobs:
                   load: true
                   push: false
                   tags: |
-                      ${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:${{ steps.version.outputs.version }}
-                      ${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:latest
+                      ${{ env.REPO }}:${{ steps.version.outputs.version }}
+                      ${{ env.REPO }}:latest
                   cache-from: type=gha
                   cache-to: type=gha,mode=max
 
             - name: Smoke test
+              env:
+                  IMAGE: ${{ env.REPO }}:${{ steps.version.outputs.version }}
               run: |
-                  IMAGE="${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:${{ steps.version.outputs.version }}"
-                    
                   echo "--- entrypoint check ---"
                   docker run --rm "$IMAGE"
 
@@ -72,12 +74,14 @@ jobs:
                     echo "::error::container runs as root"; exit 1; }
 
             - name: Extract jar from image
+              env:
+                  IMAGE: ${{ env.REPO }}:${{ steps.version.outputs.version }}
+                  JAR: myapp-${{ steps.version.outputs.version }}.jar
               run: |
-                  IMAGE="${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:${{ steps.version.outputs.version }}"
                   CID=$(docker create "$IMAGE")
-                  docker cp "$CID:/app/app.jar" "./myapp-${{ steps.version.outputs.version }}.jar"
+                  docker cp "$CID:/app/app.jar" "./$JAR"
                   docker rm "$CID"
-                  ls -lh ./myapp-*.jar
+                  ls -lh "./$JAR"
 
             - name: Upload jar artifact
               uses: actions/upload-artifact@v4
@@ -87,24 +91,34 @@ jobs:
                   if-no-files-found: error
 
             - name: Push to DockerHub
+              env:
+                  VERSION: ${{ steps.version.outputs.version }}
               run: |
-                  docker push "${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:${{ steps.version.outputs.version }}"
-                  docker push "${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:latest"
+                  docker push "$REPO:$VERSION"
+                  docker push "$REPO:latest"
 
             - name: Pull from DockerHub
+              env:
+                  VERSION: ${{ steps.version.outputs.version }}
               run: |
-                  IMAGE="${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:${{ steps.version.outputs.version }}"
-                  docker rmi "$IMAGE" "${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:latest" || true
-                  docker pull "$IMAGE"
-                  OUTPUT=$(docker run --rm "$IMAGE")
+                  docker rmi "$REPO:$VERSION" "$REPO:latest"
+
+                  docker image inspect "$REPO:$VERSION" >/dev/null 2>&1 && {
+                    echo "::error::image still present locally, the pull would be a no-op"
+                    exit 1; }
+
+                  docker pull "$REPO:$VERSION"
+                  OUTPUT=$(docker run --rm "$REPO:$VERSION")
                   echo "$OUTPUT"
 
             - name: Commit and tag the release
+              env:
+                  VERSION: ${{ steps.version.outputs.version }}
               run: |
                   git config user.name "github-actions[bot]"
                   git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
                   git add myapp/pom.xml chart/Chart.yaml
-                  git commit -m "chore: bump version to ${{ steps.version.outputs.version }} [skip ci]"
-                  git tag "v${{ steps.version.outputs.version }}"
+                  git commit -m "chore: bump version to $VERSION [skip ci]"
+                  git tag "v$VERSION"
                   git push origin HEAD:main
-                  git push origin "v${{ steps.version.outputs.version }}"
+                  git push origin "v$VERSION"

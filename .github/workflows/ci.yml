@@ -95,7 +95,7 @@ jobs:
             - name: Pull from DockerHub
               run: |
                   IMAGE="${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:${{ steps.version.outputs.version }}"
-                  docker rmi "$IMAGE" || true
+                  docker rmi "$IMAGE" "${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:latest" || true
                   docker pull "$IMAGE"
                   OUTPUT=$(docker run --rm "$IMAGE")
                   echo "$OUTPUT"

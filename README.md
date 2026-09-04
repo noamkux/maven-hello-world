@@ -490,17 +490,23 @@ individually without touching the account.
 
 ### Workflow permissions
 
-Repository **Settings → Actions → General → Workflow permissions** is set to
-**Read and write**, and the workflow additionally declares:
-
 ```yaml
-permissions:
-  contents: write
+permissions: {}
 ```
 
-This is required so the pipeline can commit the version bump and push the release
-tag. Declaring any permission explicitly also drops every other scope to `none`,
-so the line narrows the token rather than merely describing it.
+The workflow declares no permissions at all. `GITHUB_TOKEN` is still generated
+and injected into every run — that cannot be switched off — but an empty block
+sets every scope to `none`, so the token can do nothing.
+
+the pipline use deploy keys to checkout and push to the repo, by usuing this method
+every later git command in the workspace goes over SSH. The token is never
+involved in the push so there is now reason to give it any permissions.
+
+`permissions: {}` rather than removing the block: an absent block inherits the
+repository default from **Settings → Actions → General**, which grants write
+across every scope. Removing it is the widest option available, not the
+narrowest, and it moves the decision into a settings screen that is not in git,
+is not reviewed, and does not travel with a fork.
 
 ### Branch protection
 
@@ -649,12 +655,12 @@ Copy only the jar from the build stage, creating a smaller image and less attack
 Use the app user we created in the previous command
 
 `ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "-jar", "/app/app.jar"]`      
-java - use the JVM launcher to run this app.
--XX:MaxRAMPercentage=75.0 - by default the JVM allows the program to use 25% of the container RAM for the heap.
+- java - use the JVM launcher to run this app.
+- -XX:MaxRAMPercentage=75.0 - by default the JVM allows the program to use 25% of the container RAM for the heap.
 In a situation of a single program that runs in a container this is a waste of memory, I have set the limit to
 75% to use as much RAM as I can and still leave RAM for the other parts of the JVM
--jar - tells the JVM to read the manifest and find there the Main-Class
-/app/app.jar - the path of the jar file
+- -jar - tells the JVM to read the manifest and find there the Main-Class
+- /app/app.jar - the path of the jar file
 
 
 
@@ -751,7 +757,29 @@ touch ci.yml
 **trigger :** The pipline will triger only on push to the main branch and on manual dispatch.
 
 
-**permissions :** this pipline gets permissions of write to the repo, it needs to push back the updated pom.xml and the new tag. also by declaring the permissions here we can implment POLP by giving a specific scope to the pipline (all the other premissions are none).
+**permissions :** `permissions: {}` — no scopes at all. `GITHUB_TOKEN` is
+created for every run regardless of whether it is used, so the empty block is
+what reduces it to `none` everywhere. The pipeline pushes over SSH with a deploy
+key and never touches the token. Full reasoning in section 3.
+
+**timeout-minutes :** `20`. The default is 360 — six hours of runner time
+before a hung `docker pull` or a stalled Maven download is cut off. A normal run
+finishes in 3–5 minutes, so this leaves room without being theoretical.
+
+### Job-level variables
+
+`REPO` is declared once in the job's `env` block and used by every step that
+references the image:
+
+```yaml
+env:
+    REPO: ${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world
+```
+
+The `env` context is available both in `with:` blocks and in shell steps, so one
+declaration covers the build action and the scripts alike. `VERSION` cannot live
+there — the `steps` context does not exist at job level, since step outputs are
+produced during the run — so it is declared per step instead.
 
 ### Checkout
 
@@ -763,36 +791,91 @@ touch ci.yml
 
 ### Determine next version
 
+Reads the current version, validates it, and computes the next one. This step
+only calculates — nothing is written here.
 
 - `CURRENT=$(mvn -B -q help:evaluate -Dexpression=project.version -DforceStdout)` —
   asks Maven for the effective project version. Not `grep`: this pom has ten
   `<version>` elements and only one of them is the project's. `-q` silences the
   logs and `-DforceStdout` forces a clean value to stdout.
 
+- The format is validated before anything is parsed:
+
+```bash
+[[ "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+  echo "::error::unexpected version format: '$CURRENT' (expected X.Y.Z)"
+  exit 1; }
+```
+
+  Without this guard the arithmetic below does not fail on malformed input, it
+  produces a wrong answer. Bash evaluates an empty or non-numeric variable as `0`
+  in arithmetic context, so `1.0` yields `1.0.1` with a patch component that
+  never existed, and `1.0.0-SNAPSHOT` yields `1.0.1` — silently turning a
+  development version into a release.
+
+
+- Once the guard passes, `CURRENT` is known to be three numeric fields, so the
+  split and the increment are operating on a validated string:
+
 ```bash
 MAJOR=$(echo "$CURRENT" | cut -d. -f1)
 MINOR=$(echo "$CURRENT" | cut -d. -f2)
 PATCH=$(echo "$CURRENT" | cut -d. -f3)
+NEW="$MAJOR.$MINOR.$((PATCH + 1))"
 ```
 
-Breaks the version into three variables using `-d.` as the delimiter. `cut`
-fields are numbered from 1.
+  `-d.` sets the delimiter, `cut` fields are numbered from 1. 
 
-- `NEW="$MAJOR.$MINOR.$((PATCH + 1))"` — increments the patch. `$(( ))` is bash
-  arithmetic, distinct from `$( )` which runs a command.
-- `sed -i "s/^appVersion:.*/appVersion: \"$NEW\"/" ../chart/Chart.yaml` - 
-  update the version to the helm chart, explaind in the helm section.
-- `mvn -B versions:set -DnewVersion="$NEW" -DgenerateBackupPoms=false` — writes
-  the new version into the pom on the runner. The Docker build that follows picks
-  it up automatically, since `COPY myapp/pom.xml` copies the modified file.
-- `echo "version=$NEW" >> "$GITHUB_OUTPUT"` — writes the value to
-  `$GITHUB_OUTPUT`, an env variable holding a path to a temp file. At the end of
-  the step the runner publishes each `key=value` line as an output of this step's
-  `id`, reachable as `steps.version.outputs.version`.
-- `echo "Bumped $CURRENT -> $NEW"` — logging.
+- Both values are published as step outputs:
 
-**Known limitation:** this assumes the version is strictly `X.Y.Z`. A version
-like `1.0` leaves `PATCH` empty and the arithmetic fails.
+```bash
+echo "new=$NEW" >> "$GITHUB_OUTPUT"
+echo "old=$CURRENT" >> "$GITHUB_OUTPUT"
+```
+
+  `$GITHUB_OUTPUT` is an environment variable holding a path to a temp file. At
+  the end of the step the runner publishes each `key=value` line as an output of
+  this step's `id`, reachable as `steps.version.outputs.new`.
+
+
+### Bump pom.xml
+
+```bash
+mvn -B versions:set -DnewVersion="$NEW" -DgenerateBackupPoms=false
+```
+
+Writes the new version into the pom on the runner. The Docker build that follows
+picks it up automatically, since `COPY myapp/pom.xml` copies the modified file.
+
+`-DgenerateBackupPoms=false` suppresses the `pom.xml.versionsBackup` file the
+plugin writes by default. On a runner the working tree is discarded when the job
+ends, and the backup would otherwise have to be excluded from the commit.
+
+### Bump helm chart
+
+The chart carries the application version in its own metadata, so the same value
+has to reach two files. `Chart.yaml` is plain YAML with no build tool behind it,
+so this is a text substitution:
+
+```bash
+sed -i "s/^appVersion:.*/appVersion: \"$NEW\"/" chart/Chart.yaml
+grep -q "^appVersion: \"$NEW\"$" chart/Chart.yaml || {
+  echo "::error::failed to update appVersion in chart/Chart.yaml"
+  exit 1; }
+```
+
+`sed` exits `0` whether or not the pattern matched anything — for a stream
+editor, finding nothing to replace is a valid outcome, not an error. Any change
+to how the field is written in `Chart.yaml`, such as indentation or a space
+before the colon, would stop the pattern matching. The run would then finish
+green with the chart still on an old version, and `git add` would find nothing
+to stage, so the commit would succeed too. The mismatch would surface only when
+someone ran `helm install` and got an image they did not expect.
+
+The exit code of `sed` carries no information here because `sed` exits `0` 
+whether or not the pattern matched anything, so the assertion cant happend here.
+To check that the change to the chart was acctualy made grep is used to find 
+the correct line, if not exsisting it will fail the pipeline.
 
 ### Buildx
 
@@ -811,8 +894,8 @@ Use the docker/login-action@v3 to allow communication with docker hub, inject th
 uses the docker/build-push-action@v6 with the follwing arguments
 - push: `false` - after the image is built dont push it to the registry, we want to test first and the push
 - load: `true` - import the image from the builder continer to the docker daemon
-- tags: `${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:${{ steps.version.outputs.version }}` - tags the image with the correct version, same as above we got the version from the Determine next version phase
-- `${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:latest` a second tag named latest.
+- tags: `${{ env.REPO }}:${{ steps.version.outputs.version }}` - tags the image with the correct version, same as above we got the version from the Determine next version phase
+- `${{ env.REPO }}:latest` a second tag named latest.
 - cache-from: `type=gha` use the cache that is stored at git hub action cache a service that allows to store data outside the VM and call it for futere use, this is what makes our build faster with the usage of caching
 - cache-to: `type=gha,mode=max` - where to cache the data, its the other side of the same coin, the `mode=max` arg tells github to store layers that are not present in the final image 
 
@@ -835,7 +918,7 @@ echo "Running as UID: $RUN_UID"
 
 ### Extract jar from image
 
-- `IMAGE="${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world:${{ steps.version.outputs.version }}"` - save the image name as a varibale named IMAGE, 
+- `IMAGE="${{ env.REPO }}:${{ steps.version.outputs.version }}"` - save the image name as a varibale named IMAGE, 
 - `docker create "$IMAGE"` - uses the same image we just build and create a continar with this image, use docker create and not run because we dont need to run the continar we only need to acsses its FS to grab the jar file
 - `docker cp "$CID:/app/app.jar" "./myapp-${{ steps.version.outputs.version }}.jar"` - use docker cp to copy the image from the conatiner FS to the local FS of the runner
 - `docker rm "$CID"` - delete the container 
@@ -845,13 +928,18 @@ echo "Running as UID: $RUN_UID"
 
 - `actions/upload-artifact@v4` upload an artifact to git hub, enable to download the artifact directly from github for inspection.
 
+- `retention-days: 14` overrides the 90-day default. The jar already exists as a
+layer in the published image, so this artifact is a convenience for manual
+inspection rather than an archive, and does not need to outlive the interest in
+a given run.
+
 ### Push to Docker hub
 
 use basic shell command to push the image to docker hub with the two tags, one with the jar version and one with latest.
 
 ### Pull and run
 
-- use `docker rmi "$IMAGE" || true` delete the image if exsist in the local FS, ensure consistency for the testing.
+- use `docker rmi "$IMAGE"` delete the image if exsist in the local FS, ensure consistency for the testing.
 - `docker pull "$IMAGE"` pull the newly created image from docker hub for testing
 
 - `OUTPUT=$(docker run --rm "$IMAGE")` - run the contianer and save the output to a varibale named OUTPUT to print to screen later
@@ -874,11 +962,12 @@ git push origin "v<version>"
 - The email with the numeric prefix is the official user ID of
   `github-actions[bot]`, using it makes GitHub attribute the commit correctly.
 - `git add myapp/pom.xml chart/Chart.yaml` rather than `git add .` — adds the pom.xml file and the Chart.yaml file to the commit because thy are the only one that have been changed.
-- `[skip ci]` breaks the trigger loop. It is technically redundant, since commits
-  pushed with the default `GITHUB_TOKEN` do not trigger workflows — but that
-  protection is invisible in the file and disappears the moment someone swaps in a
-  PAT, which is exactly what people do when they want the bump commit to trigger
-  something.
+- `[skip ci]` breaks the trigger loop, and here it is the only thing that does.
+  The rule that commits pushed with the default `GITHUB_TOKEN` do not trigger
+  workflows applies to that token alone — this push is made over SSH with a
+  deploy key, which GitHub treats as an ordinary push. Without `[skip ci]` the
+  bump commit would trigger the workflow, which would bump, commit and trigger
+  again.
 - `git push origin HEAD:main` rather than `git push` — the Actions checkout is in
   detached HEAD state, so the target must be named explicitly.
 

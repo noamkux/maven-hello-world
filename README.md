@@ -762,6 +762,21 @@ created for every run regardless of whether it is used, so the empty block is
 what reduces it to `none` everywhere. The pipeline pushes over SSH with a deploy
 key and never touches the token. Full reasoning in section 3.
 
+### Job-level variables
+
+`REPO` is declared once in the job's `env` block and used by every step that
+references the image:
+
+```yaml
+env:
+    REPO: ${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world
+```
+
+The `env` context is available both in `with:` blocks and in shell steps, so one
+declaration covers the build action and the scripts alike. `VERSION` cannot live
+there — the `steps` context does not exist at job level, since step outputs are
+produced during the run — so it is declared per step instead.
+
 ### Checkout
 
  - runs-on - settings the VM OS to ubuntu 22.04, usuing a specific version and not latest to ensure consistency

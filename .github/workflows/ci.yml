@@ -30,14 +30,32 @@ jobs:
               working-directory: myapp
               run: |
                   CURRENT=$(mvn -B -q help:evaluate -Dexpression=project.version -DforceStdout)
+
+                  [[ "$CURRENT" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || {
+                  echo "::error::unexpected version format: '$CURRENT' (expected X.Y.Z)"
+                  exit 1; }
+
                   MAJOR=$(echo "$CURRENT" | cut -d. -f1)
                   MINOR=$(echo "$CURRENT" | cut -d. -f2)
                   PATCH=$(echo "$CURRENT" | cut -d. -f3)
                   NEW="$MAJOR.$MINOR.$((PATCH + 1))"
-                  mvn -B versions:set -DnewVersion="$NEW" -DgenerateBackupPoms=false
-                  sed -i "s/^appVersion:.*/appVersion: \"$NEW\"/" ../chart/Chart.yaml
-                  echo "version=$NEW" >> "$GITHUB_OUTPUT"
-                  echo "Bumped $CURRENT -> $NEW"
+                  echo "new=$NEW" >> "$GITHUB_OUTPUT"
+                  echo "old=$CURRENT" >> "$GITHUB_OUTPUT"
+
+            - name: Bump pom.xml file
+              working-directory: myapp
+              run: |
+                  mvn -B versions:set -DnewVersion=${{ steps.version.outputs.new }} -DgenerateBackupPoms=false
+                  echo "Bumped ${{ steps.version.outputs.old }} -> ${{ steps.version.outputs.new }}"
+            - name: Bump helm chart
+              working-directory: myapp
+              env:
+                  VERSION: ${{ steps.version.outputs.new }}
+              run: |
+                  sed -i "s/^appVersion:.*/appVersion: \"$VERSION\"/" ../chart/Chart.yaml
+                  grep -q "^appVersion: \"$VERSION\"$" ../chart/Chart.yaml || {
+                  echo "::error::failed to update appVersion in chart/Chart.yaml"
+                  exit 1; }
 
             - name: Set up Buildx
               uses: docker/setup-buildx-action@v3
@@ -55,14 +73,14 @@ jobs:
                   load: true
                   push: false
                   tags: |
-                      ${{ env.REPO }}:${{ steps.version.outputs.version }}
+                      ${{ env.REPO }}:${{ steps.version.outputs.new }}
                       ${{ env.REPO }}:latest
                   cache-from: type=gha
                   cache-to: type=gha,mode=max
 
             - name: Smoke test
               env:
-                  IMAGE: ${{ env.REPO }}:${{ steps.version.outputs.version }}
+                  IMAGE: ${{ env.REPO }}:${{ steps.version.outputs.new }}
               run: |
                   echo "--- entrypoint check ---"
                   docker run --rm "$IMAGE"
@@ -75,8 +93,8 @@ jobs:
 
             - name: Extract jar from image
               env:
-                  IMAGE: ${{ env.REPO }}:${{ steps.version.outputs.version }}
-                  JAR: myapp-${{ steps.version.outputs.version }}.jar
+                  IMAGE: ${{ env.REPO }}:${{ steps.version.outputs.new }}
+                  JAR: myapp-${{ steps.version.outputs.new }}.jar
               run: |
                   CID=$(docker create "$IMAGE")
                   docker cp "$CID:/app/app.jar" "./$JAR"
@@ -86,22 +104,22 @@ jobs:
             - name: Upload jar artifact
               uses: actions/upload-artifact@v4
               with:
-                  name: myapp-${{ steps.version.outputs.version }}
-                  path: ./myapp-${{ steps.version.outputs.version }}.jar
+                  name: myapp-${{ steps.version.outputs.new }}
+                  path: ./myapp-${{ steps.version.outputs.new }}.jar
                   if-no-files-found: error
 
             - name: Push to DockerHub
               env:
-                  VERSION: ${{ steps.version.outputs.version }}
+                  VERSION: ${{ steps.version.outputs.new }}
               run: |
                   docker push "$REPO:$VERSION"
                   docker push "$REPO:latest"
 
             - name: Pull from DockerHub
               env:
-                  VERSION: ${{ steps.version.outputs.version }}
+                  VERSION: ${{ steps.version.outputs.new }}
               run: |
-                  docker rmi "$REPO:$VERSION" "$REPO:latest"
+                  docker rmi "$REPO:$VERSION" "$REPO:latest" || true
 
 
                   docker pull "$REPO:$VERSION"
@@ -110,7 +128,7 @@ jobs:
 
             - name: Commit and tag the release
               env:
-                  VERSION: ${{ steps.version.outputs.version }}
+                  VERSION: ${{ steps.version.outputs.new }}
               run: |
                   git config user.name "github-actions[bot]"
                   git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

@@ -142,7 +142,7 @@ jobs:
                   helm install hello chart/ \
                     --set image.repository="$REPO" \
                     --set image.tag="$VERSION" \
-                    --wait --timeout 3m
+                    --wait --wait-for-jobs --timeout 3m
 
                   kubectl logs job/hello
 

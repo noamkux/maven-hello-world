@@ -128,6 +128,24 @@ jobs:
                   OUTPUT=$(docker run --rm "$REPO:$VERSION")
                   echo "$OUTPUT"
 
+            - name: Create kind cluster
+              uses: helm/kind-action@v1
+              with:
+                  cluster_name: ci
+
+            - name: Deploy with Helm
+              env:
+                  VERSION: ${{ steps.version.outputs.new }}
+              run: |
+                  helm lint chart/
+
+                  helm install hello chart/ \
+                    --set image.repository="$REPO" \
+                    --set image.tag="$VERSION" \
+                    --wait --timeout 3m
+
+                  kubectl logs job/hello
+
             - name: Tag the release
               env:
                   VERSION: ${{ steps.version.outputs.new }}

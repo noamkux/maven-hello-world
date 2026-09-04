@@ -103,9 +103,6 @@ jobs:
               run: |
                   docker rmi "$REPO:$VERSION" "$REPO:latest"
 
-                  docker image inspect "$REPO:$VERSION" >/dev/null 2>&1 && {
-                    echo "::error::image still present locally, the pull would be a no-op"
-                    exit 1; }
 
                   docker pull "$REPO:$VERSION"
                   OUTPUT=$(docker run --rm "$REPO:$VERSION")

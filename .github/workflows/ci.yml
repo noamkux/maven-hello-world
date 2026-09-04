@@ -23,7 +23,6 @@ jobs:
               with:
                   java-version: "17"
                   distribution: "temurin"
-                  cache: maven
 
             - name: Determine next version
               id: version

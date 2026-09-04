@@ -490,17 +490,23 @@ individually without touching the account.
 
 ### Workflow permissions
 
-Repository **Settings → Actions → General → Workflow permissions** is set to
-**Read and write**, and the workflow additionally declares:
-
 ```yaml
-permissions:
-  contents: write
+permissions: {}
 ```
 
-This is required so the pipeline can commit the version bump and push the release
-tag. Declaring any permission explicitly also drops every other scope to `none`,
-so the line narrows the token rather than merely describing it.
+The workflow declares no permissions at all. `GITHUB_TOKEN` is still generated
+and injected into every run — that cannot be switched off — but an empty block
+sets every scope to `none`, so the token can do nothing.
+
+the pipline use deploy keys to checkout and push to the repo, by usuing this method
+every later git command in the workspace goes over SSH. The token is never
+involved in the push so there is now reason to give it any permissions.
+
+`permissions: {}` rather than removing the block: an absent block inherits the
+repository default from **Settings → Actions → General**, which grants write
+across every scope. Removing it is the widest option available, not the
+narrowest, and it moves the decision into a settings screen that is not in git,
+is not reviewed, and does not travel with a fork.
 
 ### Branch protection
 
@@ -751,7 +757,10 @@ touch ci.yml
 **trigger :** The pipline will triger only on push to the main branch and on manual dispatch.
 
 
-**permissions :** this pipline gets permissions of write to the repo, it needs to push back the updated pom.xml and the new tag. also by declaring the permissions here we can implment POLP by giving a specific scope to the pipline (all the other premissions are none).
+**permissions :** `permissions: {}` — no scopes at all. `GITHUB_TOKEN` is
+created for every run regardless of whether it is used, so the empty block is
+what reduces it to `none` everywhere. The pipeline pushes over SSH with a deploy
+key and never touches the token. Full reasoning in section 3.
 
 ### Checkout
 
@@ -874,11 +883,12 @@ git push origin "v<version>"
 - The email with the numeric prefix is the official user ID of
   `github-actions[bot]`, using it makes GitHub attribute the commit correctly.
 - `git add myapp/pom.xml chart/Chart.yaml` rather than `git add .` — adds the pom.xml file and the Chart.yaml file to the commit because thy are the only one that have been changed.
-- `[skip ci]` breaks the trigger loop. It is technically redundant, since commits
-  pushed with the default `GITHUB_TOKEN` do not trigger workflows — but that
-  protection is invisible in the file and disappears the moment someone swaps in a
-  PAT, which is exactly what people do when they want the bump commit to trigger
-  something.
+- `[skip ci]` breaks the trigger loop, and here it is the only thing that does.
+  The rule that commits pushed with the default `GITHUB_TOKEN` do not trigger
+  workflows applies to that token alone — this push is made over SSH with a
+  deploy key, which GitHub treats as an ordinary push. Without `[skip ci]` the
+  bump commit would trigger the workflow, which would bump, commit and trigger
+  again.
 - `git push origin HEAD:main` rather than `git push` — the Actions checkout is in
   detached HEAD state, so the target must be named explicitly.
 

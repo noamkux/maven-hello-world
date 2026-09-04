@@ -522,7 +522,7 @@ in github and injected to the runner in the ci.yml file.
 
 The fork ships as `<version>1.0-SNAPSHOT</version>`. In Maven, the `-SNAPSHOT`
 suffix marks a version as still in development: Maven re-checks remote
-repositories for a newer copy, whereas a release version is fetched once and
+repositories for a newer copy, when a release version is fetched once and
 cached permanently. An automatic patch bump has no meaning on top of a SNAPSHOT,
 which is why the exercise requires moving to `1.0.0` first.
 
@@ -536,12 +536,40 @@ runs, so running it locally first confirms it behaves correctly on this project
 before it costs a CI cycle. `-DgenerateBackupPoms=false` suppresses the
 `pom.xml.versionsBackup` file the plugin writes by default.
 
-2. Change the following lines in the pom.xml file, this will make the compiler run as a JDK 17 version.
-using the source and target attributes in the pom file will enforce the usage of an allowed syntax in a specific
-java version and add the proper label to the byte code, but doesn't enforce building with the correct JDK.
-changing these to the release attribute also enforces the API of the declared version, so code cannot compile
-against a method that doesn't exist in it.
+2. Change the compiler configuration in `pom.xml`:
 
+```xml
+<!-- from -->
+<maven.compiler.source>1.7</maven.compiler.source>
+<maven.compiler.target>1.7</maven.compiler.target>
+
+<!-- to -->
+<maven.compiler.release>17</maven.compiler.release>
+```
+
+**The mechanism.** `source` controls allowed syntax and `target` stamps the
+bytecode version, but neither constrains the API — `javac` resolves method calls
+against whichever JDK it runs inside. `release` resolves against the declared
+version's real API.
+
+**The level.** Raising 7 to 17 is a language-version decision that belongs to
+developers, not the pipeline. It was raised here because `1.7` was never chosen —
+it's the `maven-archetype-quickstart` default — and the code uses nothing past
+Java 1.0. It also couldn't stay: `source`/`target` `1.7` were removed in JDK 20,
+and `release 7` is rejected by JDK 17. Keeping Java 7 would mean pinning both base
+images to JDK 11 — the right call with real Java 7 code, not with one `println`.
+
+Pinning to JDK 11 would have cost more than its age suggests. Container
+awareness gained cgroups v2 support only in 11.0.16 — and modern hosts and
+clusters run v2, so an earlier build would fall back to reading host memory
+inside a container. That is exactly the OOMKilled failure described in section
+2.2, and it would make the `-XX:MaxRAMPercentage` setting in the Dockerfile
+meaningless.
+
+That is the general cost of pinning to an older runtime: not that the version is
+old, but that using it correctly requires knowing which fixes landed in which
+patch release, for every behaviour you depend on. None of those questions arise
+on 17.
 
 ### .gitignore
 

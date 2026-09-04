@@ -10,6 +10,7 @@ permissions: {}
 jobs:
     build:
         runs-on: ubuntu-22.04
+        timeout-minutes: 20
         env:
             REPO: ${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world
 
@@ -107,6 +108,7 @@ jobs:
                   name: myapp-${{ steps.version.outputs.new }}
                   path: ./myapp-${{ steps.version.outputs.new }}.jar
                   if-no-files-found: error
+                  retention-days: 14
 
             - name: Push to DockerHub
               env:
@@ -119,9 +121,7 @@ jobs:
               env:
                   VERSION: ${{ steps.version.outputs.new }}
               run: |
-                  docker rmi "$REPO:$VERSION" "$REPO:latest" || true
-
-
+                  docker rmi "$REPO:$VERSION" "$REPO:latest"
                   docker pull "$REPO:$VERSION"
                   OUTPUT=$(docker run --rm "$REPO:$VERSION")
                   echo "$OUTPUT"

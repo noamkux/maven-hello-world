@@ -5,7 +5,12 @@ on:
         branches: [main]
     workflow_dispatch:
 
-permissions: {}
+permissions:
+    contents: write
+
+concurrency:
+    group: release-${{ github.ref }}
+    cancel-in-progress: false
 
 jobs:
     build:
@@ -18,7 +23,8 @@ jobs:
             - name: Checkout
               uses: actions/checkout@v4
               with:
-                  ssh-key: ${{ secrets.DEPLOY_KEY }}
+                  fetch-depth: 0
+                  filter: tree:0
 
             - name: Set up JDK 17
               uses: actions/setup-java@v4
@@ -30,7 +36,7 @@ jobs:
               id: version
               working-directory: myapp
               run: |
-                  CURRENT=$(mvn -B -q help:evaluate -Dexpression=project.version -DforceStdout)
+                  CURRENT=$(mvn -B -q -ntp help:evaluate -Dexpression=project.version -DforceStdout)
 
                   [[ "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
                   echo "::error::unexpected version format: '$CURRENT' (expected X.Y.Z)"
@@ -38,28 +44,19 @@ jobs:
 
                   MAJOR=$(echo "$CURRENT" | cut -d. -f1)
                   MINOR=$(echo "$CURRENT" | cut -d. -f2)
-                  PATCH=$(echo "$CURRENT" | cut -d. -f3)
-                  NEW="$MAJOR.$MINOR.$((PATCH + 1))"
+
+                  LAST=$(git tag -l "v$MAJOR.$MINOR.*" --sort=-v:refname | head -n1)
+                  if [ -z "$LAST" ]; then
+                    NEW="$MAJOR.$MINOR.0"
+                    OLD="none"
+                  else
+                    PATCH=$(echo "$LAST" | cut -d. -f3)
+                    NEW="$MAJOR.$MINOR.$((PATCH + 1))"
+                    OLD="${LAST#v}"
+                  fi
+
                   echo "new=$NEW" >> "$GITHUB_OUTPUT"
-                  echo "old=$CURRENT" >> "$GITHUB_OUTPUT"
-
-            - name: Bump pom.xml file
-              working-directory: myapp
-              env:
-                  OLD: ${{ steps.version.outputs.old }}
-                  NEW: ${{ steps.version.outputs.new }}
-              run: |
-                  mvn -B versions:set -DnewVersion="$NEW" -DgenerateBackupPoms=false
-                  echo "Bumped $OLD -> $NEW"
-
-            - name: Bump helm chart
-              env:
-                  NEW: ${{ steps.version.outputs.new }}
-              run: |
-                  sed -i "s/^appVersion:.*/appVersion: \"$NEW\"/" chart/Chart.yaml
-                  grep -q "^appVersion: \"$NEW\"$" chart/Chart.yaml || {
-                  echo "::error::failed to update appVersion in chart/Chart.yaml"
-                  exit 1; }
+                  echo "Version bump: $OLD -> $NEW"
 
             - name: Set up Buildx
               uses: docker/setup-buildx-action@v3
@@ -76,6 +73,8 @@ jobs:
                   context: .
                   load: true
                   push: false
+                  build-args: |
+                      APP_VER=${{ steps.version.outputs.new }}
                   tags: |
                       ${{ env.REPO }}:${{ steps.version.outputs.new }}
                       ${{ env.REPO }}:latest
@@ -129,14 +128,11 @@ jobs:
                   OUTPUT=$(docker run --rm "$REPO:$VERSION")
                   echo "$OUTPUT"
 
-            - name: Commit and tag the release
+            - name: Tag the release
               env:
                   VERSION: ${{ steps.version.outputs.new }}
               run: |
                   git config user.name "github-actions[bot]"
                   git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-                  git add myapp/pom.xml chart/Chart.yaml
-                  git commit -m "chore: bump version to $VERSION [skip ci]"
                   git tag "v$VERSION"
-                  git push origin HEAD:main
                   git push origin "v$VERSION"

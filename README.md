@@ -641,9 +641,14 @@ Use maven to package the app, maven will run until the package phase in the defa
 The start of a new stage using the JRE Alpine image. This image will be the
 runtime image for the app
 
-`RUN addgroup -S app && adduser -S -G app app`      
-Create a non-root group and non-root user using the -S flag to create a system user/group.
-This creates a user with a locked password, no home dir and a nologin shell
+
+`RUN addgroup -S -g 10001 app && adduser -S -u 10001 -G app app`
+`-S` creates a system account — password locked, shell `/sbin/nologin`. `-u` and
+`-g` set the IDs explicitly; without them `adduser` takes the first free ID from
+100 upward, which depends on what the base image already contains and can move
+on an update. `-G` puts the user in the group created on its left, which is why
+the two commands are chained.
+
 
 `WORKDIR /app`      
 Create a new workdir for the runtime
@@ -651,8 +656,12 @@ Create a new workdir for the runtime
 `COPY --from=build --chown=app:app /build/target/myapp-*.jar /app/app.jar`      
 Copy only the jar from the build stage, creating a smaller image and less attack surface
 
-`USER app`      
-Use the app user we created in the previous command
+`USER 10001:10001`      
+Use the user to the user we created in the previous command.
+Also takes the numeric ID, not the name. Kubernetes reads the `User` field
+from the image config before the container starts and cannot resolve a name -
+that would mean running the image it is trying to check.With
+`runAsNonRoot: true` set, a name-based `USER` fails the pod:
 
 `ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75.0", "-jar", "/app/app.jar"]`      
 - java - use the JVM launcher to run this app.

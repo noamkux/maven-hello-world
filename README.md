@@ -406,6 +406,9 @@ kubectl  1.29+
 Helm  3.x  
 minikube for Local cluster for the deployment step 
 
+Helm 3.5 is the floor because of `--wait-for-jobs`, added in that release. A local cluster is optional: the pipeline creates its own kind cluster on the runner, so nothing here is needed to run CI.
+
+
 ### Fork & clone
 
 ```bash
@@ -414,12 +417,10 @@ cd maven-hello-world
 ```
 ### Docker Hub
 
-A public repository at noamkux/maven-hello-world.
+Two public repositories: `noamkux/maven-hello-world` for releases, and `noamkux/maven-hello-world-ci` for dry runs (section 7).
 
-Public was a deliberate choice, for two reasons: the pipeline's final step pulls
-and runs the image, which needs no authentication when the repository is public,
-and the Helm deployment needs no `imagePullSecret`. A private repository would
-have added an authentication step in both places for no benefit here.
+Public was a deliberate choice, for two reasons: the pipeline's final step pulls and runs the image, which needs no authentication when the repository is public, and the Helm deployment needs no `imagePullSecret`. 
+A private repository would have added an authentication step in both places for no benefit here.
 
 ### Credentials — secrets vs. variables
 
@@ -440,34 +441,19 @@ individually without touching the account.
 ### Workflow permissions
 
 ```yaml
-permissions: {}
+permissions:
+  contents: read
 ```
 
-The workflow declares no permissions at all. `GITHUB_TOKEN` is still generated
-and injected into every run — that cannot be switched off — but an empty block
-sets every scope to `none`, so the token can do nothing.
+`GITHUB_TOKEN` is created for every run whether or not it is used, so the only question is what it may do. The block is declared rather than omitted: an absent block inherits the repository default from **Settings → Actions → General**, a setting that is not in git, is not reviewed, and does not travel with a fork.
 
-the pipline use deploy keys to checkout and push to the repo, by usuing this method
-every later git command in the workspace goes over SSH. The token is never
-involved in the push so there is now reason to give it any permissions.
-
-`permissions: {}` rather than removing the block: an absent block inherits the
-repository default from **Settings → Actions → General**, which grants write
-across every scope. Removing it is the widest option available, not the
-narrowest, and it moves the decision into a settings screen that is not in git,
-is not reviewed, and does not travel with a fork.
+`contents: read` is what `actions/checkout` needs and nothing more. The `tag` job re-declares `contents: write`, and a job-level block **replaces** the workflow-level one rather than adding to it, so that job has write on contents and nothing elsewhere, while everything in `build` (including every third-party action) stays read-only. Permissions exist at workflow and job level only, never per step, so splitting the tag into its own job is what makes this granularity possible.
 
 ### Branch protection
 
-`main` is protected by a repository ruleset: pull requests required, force pushes
-blocked, deletions blocked. Required approvals is 0 — a single-contributor
-repository cannot satisfy a review requirement, and a rule that cannot be met is
-a rule that gets bypassed.
+`main` is protected by a repository ruleset: pull requests required, force pushes and deletions blocked, and `pr-check` required as a status check. Required approvals is 0, because a single-contributor repository cannot satisfy a review requirement, and a rule that cannot be met is a rule that gets bypassed.
 
-to let the runner push to the repo (tags and the updated pom file) i have
-created a deploy key for the runner.
-the deploy key is allowd to push to repo in the ruleset, the key itself is saved as a secret
-in github and injected to the runner in the ci.yml file.
+**The bypass list is empty, including for Actions.** Nothing in the pipeline writes to `main`. The only write is `git push origin "v$VERSION"`, which creates a ref outside the protected branch, so the automation is subject to the same rule as a human contributor.
 
 ## 4. Code Changes
 
@@ -568,23 +554,26 @@ Use an explicit maven version and name it as build for future multistage use
 `WORKDIR /build`      
 Create a workdir for the build named "build"
 
-`COPY myapp/pom.xml .`       
-Copy only the pom.xml file, this file doesn't change as often
-so this layer and the run command won't rerun
-in every build, this will improve the performance of the build.
+`COPY myapp/pom.xml .`
+Copy the pom on its own. The pom never changes in CI (section 1), so this layer is a permanent cache hit and everything under it survives.
 
-`RUN mvn -B -e dependency:go-offline`      
-Use the -B flag to run in batch mode (no user input needed), -e shows the full error if there is any
-dependency:go-offline uses the dependency plugin and sets the goal of go-offline.
-This will allow downloading all the needed dependencies to a cache layer and improve the performance of the Dockerfile.
+`RUN mvn -B -e -ntp dependency:go-offline`
+Resolves and downloads the dependencies into the image. `-B` is batch mode (no progress bars, no interactive prompts), `-e` prints full stack traces on failure, `-ntp` hides the transfer log. This is the expensive layer, 61.8s cold, and keeping it cached is the reason the pom is copied separately.
 
-`COPY myapp/src ./src`       
-Copy the source code, this separation is what makes the caching of the dependencies valuable,
-because this layer can change frequently
+The goal is not a guarantee of an offline build. It resolves declared dependencies and the plugins the lifecycle binds, but misses plugins invoked by hand. Verified: adding `-o` to the build fails on `versions-maven-plugin`, which this layer never fetched. It is a warm cache, not an offline guarantee.
 
+`COPY myapp/src ./src`
+The source, copied after the dependencies. This is the layer that actually changes between builds.
 
-`RUN mvn -B package`       
-Use maven to package the app, maven will run until the package phase in the default lifecycle.
+`ARG APP_VER=0.0.0`
+The version, injected by the pipeline as `--build-arg APP_VER=1.0.18`.
+
+**Its position is the point.** BuildKit treats an `ARG` declaration as a layer, so changing the value invalidates only what is below it. Declared at the top of the file, every version bump would invalidate the dependency download. Declared here, a new version rebuilds two cheap layers: 83.1s before, 20.1s after.
+
+`RUN mvn -B -ntp versions:set -DnewVersion="$APP_VER" -DgenerateBackupPoms=false package`
+Writes the version into the pom inside the image, then builds. Because the jar is packaged from the real pom, `pom.properties` carries the released version and the artifact does not misreport itself. `-DgenerateBackupPoms=false` suppresses the `pom.xml.versionsBackup` file the plugin writes by default.
+
+No `clean`: the layer is created fresh on every run, so there is nothing to clean. `clean` is still correct locally, where `target/` persists between
 
 `FROM eclipse-temurin:17.0.13_11-jre-alpine`      
 The start of a new stage using the JRE Alpine image. This image will be the
@@ -602,8 +591,8 @@ the two commands are chained.
 `WORKDIR /app`      
 Create a new workdir for the runtime
 
-`COPY --from=build --chown=app:app /build/target/myapp-*.jar /app/app.jar`      
-Copy only the jar from the build stage, creating a smaller image and less attack surface
+`COPY --from=build --chown=10001:10001 /build/target/myapp-*.jar /app/app.jar`
+Copy only the jar out of the build stage, leaving the JDK, Maven and `~/.m2` behind. The ownership is set numerically for the same reason `USER` is, below.
 
 `USER 10001:10001`      
 Use the user to the user we created in the previous command.
@@ -666,27 +655,23 @@ layers rerun, the pom and dependency layers stay cached.
 **Change the version**
 
 ```bash
-cd myapp && mvn versions:set -DnewVersion=1.0.1 -DgenerateBackupPoms=false && cd ..
-docker build -t maven-hello-world:1.0.1 .
+docker build --build-arg APP_VER=1.0.1 -t maven-hello-world:1.0.1 .
 ```
 
 ```
-=> [build 3/6] COPY myapp/pom.xml .
-=> [build 4/6] RUN mvn -B -e dependency:go-offline
+=> CACHED [build 3/7] COPY myapp/pom.xml .
+=> CACHED [build 4/7] RUN mvn -B -e -ntp dependency:go-offline
+=> CACHED [build 5/7] COPY myapp/src ./src
+=> [build 6/7] RUN mvn -B -ntp versions:set -DnewVersion="1.0.1" ... package
 ```
 
-**Note that both rebuild.** Changing the pom invalidates the `COPY` layer, and
-everything below it goes with it — including the 69-second dependency download.
-This is the measured cost of keeping the version in the pom, discussed in the
-Versioning Strategy section above.
-
-**Check the running user inside the continer is not root**
+Only the build layer reruns. The dependency download stays cached because nothing above the `ARG` changed, which is the whole argument for where it sits.
 
 ```bash
 docker run --rm --entrypoint id maven-hello-world:1.0.0
 ```
 ```bash
-uid=100(app) gid=101(app) groups=101(app)
+uid=10001(app) gid=10001(app) groups=10001(app)
 ```
 ***
 **Check the image size**

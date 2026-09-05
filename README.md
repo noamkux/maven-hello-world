@@ -1032,13 +1032,36 @@ concurrency:
   cancel-in-progress: true
 ```
 
-Lint the chart, build the image with `APP_VER=0.0.0-pr`, smoke test it, create a kind cluster, deploy. Same checks as `ci.yml`, same Dockerfile, same chart.
+Lint the Dockerfile, lint the chart, run `mvn verify`, build the image with `APP_VER=0.0.0-pr`, smoke test it, create a kind cluster, deploy.
 
-**What it does not do:** compute a version, push to Docker Hub, or create a tag. No `setup-java` either, since nothing here reads the pom.
+**What it does not do:** compute a version, push to Docker Hub, or create a tag.
 
 `permissions: {}` at workflow level and `contents: read` on the job, which is all `actions/checkout` needs.
 
 `cancel-in-progress: true`, the opposite of `ci.yml`. `pull_request` fires on `synchronize` as well as `opened`, so pushing another commit starts a new run. The previous one is now testing code nobody will merge, and killing it costs nothing because it publishes nothing. In `ci.yml` a cancelled run could leave a published image untagged, which is why that one waits instead.
+
+### Checks that only exist here
+
+`pr.yml` and `ci.yml` overlap on purpose: the same build, the same chart, the same smoke test, run before and after the merge. What changes is the question. `pr.yml` asks whether the code is sound, so it runs on a locally built image. `ci.yml` pulls from Docker Hub, because there the point is proving that the published artifact is complete and runnable.
+
+Two checks exist only in `pr.yml`, since a pull request is where cheap feedback is worth most:
+
+```yaml
+- name: Lint Dockerfile
+  uses: hadolint/hadolint-action@v3.1.0
+  with:
+    dockerfile: Dockerfile
+
+- name: Verify
+  working-directory: myapp
+  run: mvn -B -ntp verify
+```
+
+`hadolint` is a static check on the Dockerfile: pinned base images, no unnecessary root, no `apt-get` without cleanup.
+
+`mvn verify` runs the tests directly rather than waiting for the Docker build to run them. Same tests, but a failure surfaces in about 40 seconds under a step named `Verify`, instead of being buried in a BuildKit log after a full image build. `verify` rather than `test` because it also packages and runs integration tests, and it is the phase where coverage gates and security scans belong later.
+
+`setup-java` carries `cache: maven`, which persists `~/.m2` between runs. Without it every pull request re-downloads the dependencies and the early feedback is no longer early.
 
 ### Loading the image without a registry
 
@@ -1148,3 +1171,43 @@ The cluster starts empty, so the image is pulled from Docker Hub rather than loa
 - `image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"`      
 {{ .Values.image.repository }} - uses the image.repostery name from the chart/Values.yaml file.         
 {{ .Values.image.tag | default .Chart.AppVersion }} - takes the version either from the --set command in the cli or the values.yaml file if nither xsist takes it from Chart.yaml
+
+### Resources and securityContext
+
+```yaml
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+```
+
+Two `securityContext` blocks at different levels: the pod-level one decides who runs the container, the container-level one decides what it is allowed to do.
+
+**`runAsNonRoot: true` is what turns the numeric UID in the Dockerfile from a property of the image into something the cluster enforces.** Without it, the image says it runs as 10001 and nothing checks. With it, the kubelet reads the `User` field from the image config before starting the container and refuses to start a pod whose image would run as root. This is also why the UID has to be numeric: the kubelet cannot resolve a username without running the image it is trying to verify.
+
+**`limits.memory` is what makes `-XX:MaxRAMPercentage=75.0` mean anything.** With no limit there is no cgroup ceiling, so the JVM reads the node's memory and sizes its heap against that. Verified against a 256Mi limit:
+
+```
+size_t MaxHeapSize = 201326592 {product} {ergonomic}
+```
+
+192MB, exactly 75% of 256Mi, and `{ergonomic}` confirms the JVM derived it from the cgroup rather than being told directly. That chain (`limits.memory` → cgroup → `UseContainerSupport` → `MaxRAMPercentage`) is what section 2.2 describes going wrong when any link is missing.
+
+No `limits.cpu`. Exceeding memory means an OOMKill, so the ceiling protects the node. Exceeding CPU only means throttling, and a CPU limit slows a process that had room to run.
+
+`readOnlyRootFilesystem: true` because the application writes nothing. If it ever does, it fails immediately rather than writing into a container layer that disappears.
+
+**`helm lint` does not catch mistakes here.** It validates Helm syntax and knows nothing about the Job schema, so an indentation error that moved `capabilities` one level out of `securityContext` passed lint and was rejected only by the API server. `kubectl apply --dry-run=server` is what catches that class of error.

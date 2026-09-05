@@ -1,68 +1,84 @@
 name: PR
 
 on:
-    pull_request:
-        branches: [main]
+  pull_request:
+    branches: [main]
 
 permissions: {}
 
 concurrency:
-    group: pr-${{ github.event.pull_request.number }}
-    cancel-in-progress: true
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
-    pr-check:
-        runs-on: ubuntu-22.04
-        timeout-minutes: 15
-        permissions:
-            contents: read
-        env:
-            IMAGE: maven-hello-world:pr
+  pr-check:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      IMAGE: maven-hello-world:pr
 
-        steps:
-            - name: Checkout
-              uses: actions/checkout@v4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-            - name: Lint chart
-              run: helm lint chart/
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
 
-            - name: Set up Buildx
-              uses: docker/setup-buildx-action@v3
+      - name: Lint chart
+        run: helm lint chart/
 
-            - name: Build image
-              uses: docker/build-push-action@v6
-              with:
-                  context: .
-                  load: true
-                  push: false
-                  build-args: |
-                      APP_VER=0.0.0-pr
-                  tags: ${{ env.IMAGE }}
-                  cache-from: type=gha
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: maven
 
-            - name: Smoke test
-              run: |
-                  echo "--- entrypoint check ---"
-                  docker run --rm "$IMAGE"
+      - name: Verify
+        working-directory: myapp
+        run: mvn -B -ntp verify
 
-                  echo "--- non-root check ---"
-                  RUN_UID=$(docker run --rm --entrypoint id "$IMAGE" -u)
-                  echo "Running as UID: $RUN_UID"
-                  [ "$RUN_UID" != "0" ] || {
-                    echo "::error::container runs as root"; exit 1; }
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
 
-            - name: Create kind cluster
-              uses: helm/kind-action@v1
-              with:
-                  cluster_name: pr
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          build-args: |
+            APP_VER=0.0.0-pr
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha
 
-            - name: Deploy with Helm
-              run: |
-                  kind load docker-image "$IMAGE" --name pr
+      - name: Smoke test
+        run: |
+          echo "--- entrypoint check ---"
+          docker run --rm "$IMAGE"
 
-                  helm install hello chart/ \
-                    --set image.repository=maven-hello-world \
-                    --set image.tag=pr \
-                    --wait --wait-for-jobs --timeout 3m
+          echo "--- non-root check ---"
+          RUN_UID=$(docker run --rm --entrypoint id "$IMAGE" -u)
+          echo "Running as UID: $RUN_UID"
+          [ "$RUN_UID" != "0" ] || {
+            echo "::error::container runs as root"; exit 1; }
 
-                  kubectl logs job/hello
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: pr
+
+      - name: Deploy with Helm
+        run: |
+          kind load docker-image "$IMAGE" --name pr
+
+          helm install hello chart/ \
+            --set image.repository=maven-hello-world \
+            --set image.tag=pr \
+            --wait --wait-for-jobs --timeout 3m
+
+          kubectl logs job/hello

@@ -880,55 +880,182 @@ Taking the jar from the image rather than building it separately on the runner m
 
 `retention-days: 14` overrides the 90-day default. The jar already exists as a layer in the published image, so this is a convenience for inspection rather than an archive.
 
-### Push to Docker hub
-
-use basic shell command to push the image to docker hub with the two tags, one with the jar version and one with latest.
-
-### Pull and run
-
-- use `docker rmi "$IMAGE"` delete the image if exsist in the local FS, ensure consistency for the testing.
-- `docker pull "$IMAGE"` pull the newly created image from docker hub for testing
-
-- `OUTPUT=$(docker run --rm "$IMAGE")` - run the contianer and save the output to a varibale named OUTPUT to print to screen later
-- `echo "$OUTPUT"` - print the result of the docker run
-
-### Commit and tag the release
-
-The last step, so a failure anywhere earlier leaves the repository untouched.
+### Push version tag
 
 ```bash
-git config user.name "github-actions[bot]"
-git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-git add myapp/pom.xml chart/Chart.yaml
-git commit -m "chore: bump version to <version> [skip ci]"
-git tag "v<version>"
-git push origin HEAD:main
-git push origin "v<version>"
+docker push "$REPO:$VERSION"
 ```
 
-- The email with the numeric prefix is the official user ID of
-  `github-actions[bot]`, using it makes GitHub attribute the commit correctly.
-- `git add myapp/pom.xml chart/Chart.yaml` rather than `git add .` — adds the pom.xml file and the Chart.yaml file to the commit because thy are the only one that have been changed.
-- `[skip ci]` breaks the trigger loop, and here it is the only thing that does.
-  The rule that commits pushed with the default `GITHUB_TOKEN` do not trigger
-  workflows applies to that token alone — this push is made over SSH with a
-  deploy key, which GitHub treats as an ordinary push. Without `[skip ci]` the
-  bump commit would trigger the workflow, which would bump, commit and trigger
-  again.
-- `git push origin HEAD:main` rather than `git push` — the Actions checkout is in
-  detached HEAD state, so the target must be named explicitly.
+A plain `docker push` rather than a second call to `build-push-action`. The action would rebuild, and even with a full cache hit that is a weaker claim than pushing the exact object that just passed the smoke test. This pushes the same digest.
 
+Only the version tag goes up here. `latest` waits.
 
-## 8 Helm chart
+### Pull from DockerHub
 
-### workload
-I have used a job workload becuase this program dosent run in a infinite loop, if i will used deployment Kubernetes will restart the continer after the program exists (Deployment restartPolicy have to be always) eventually this will caused a CrashLoopBackOff. 
+```bash
+docker rmi "$REPO:$VERSION"
+docker pull "$REPO:$VERSION"
+docker run --rm "$REPO:$VERSION"
+```
+
+`docker rmi` first is what makes the pull real. Without it the daemon already holds the image, the pull is a no-op, and the step proves nothing. Removing it forces a genuine round trip through the registry, which verifies that what was published is complete and runnable.
+
+This satisfies task 5.7 and is also the last check before anything is deployed.
+
+### Create kind cluster
+
+`helm/kind-action@v1` builds a Kubernetes cluster inside the runner.
+
+**Why not minikube.** Deploying on my own machine proves the chart works on my machine. A cluster created inside the pipeline is evidence attached to the run, reproducible by anyone reading it. minikube would also not work here: the runner has no nested virtualisation, so its default driver has nothing to run on.
+
+The cluster is created empty, which makes the deployment pull from Docker Hub by necessity rather than by configuration. No image is preloaded, so a successful deployment proves the published image is pullable and runnable by a third party.
+
+### Deploy with Helm
+
+```bash
+RENDERED=$(helm template hello chart/ \
+  --set image.repository="$REPO" \
+  --set image.tag="$VERSION" \
+  | grep -oP '^\s*image:\s*"?\K[^"]+')
+
+[ "$RENDERED" = "$REPO:$VERSION" ] || {
+  echo "::error::chart renders $RENDERED, expected $REPO:$VERSION"
+  exit 1; }
+```
+
+The chart falls back to `appVersion` when no tag is given, which is the right default for a manual install and a silent failure in CI. A `--set` that does not arrive would deploy `1.0.0`, run successfully, and leave the pipeline green while having deployed the wrong version.
+
+`helm template` renders locally in a second, before the cluster is involved, so the check runs on what will be sent rather than on what came back.
+
+```bash
+helm install hello chart/ \
+  --set image.repository="$REPO" \
+  --set image.tag="$VERSION" \
+  --wait --wait-for-jobs --timeout 3m
+
+kubectl logs job/hello
+```
+
+`--wait` alone is not enough. It waits for resources to become ready, and for a Job that means created, not finished. `--wait-for-jobs` (Helm 3.5+) waits for completion. Without it `kubectl logs` runs against a pod still in `ContainerCreating`.
+
+`--set image.repository` is passed as well as the tag, so a dry run deploys from the scratch repository rather than from the one named in `values.yaml`.
+
+### Promote latest
+
+```bash
+docker tag "$REPO:$VERSION" "$REPO:latest"
+docker push "$REPO:latest"
+```
+
+`latest` is a moving tag that people pull without thinking. Publishing it alongside the version tag would mean a build that fails to deploy still becomes the default for everyone. Moving it here changes its meaning from "the last thing built" to "the last thing successfully deployed", which is what its users already assume it means.
+
+A tag is a pointer, not a copy, so this push transfers no layers. The registry recognises every digest and writes a new manifest.
+
+The image being tagged is the one pulled back from Docker Hub and deployed, since the local build was removed in the pull step.
+
+### Tag the release
+
+A separate job:
+
+```yaml
+tag:
+  needs: build
+  if: ${{ !inputs.dry_run }}
+  permissions:
+    contents: write
+```
+
+**Why a second job.** `contents: write` is the only elevated permission in the workflow, and permissions exist at workflow and job level only, never per step. In a single job it would apply to every third-party action in the run. Splitting it means `setup-java`, `buildx`, `login-action`, `build-push-action`, `upload-artifact` and `kind-action` all execute read-only, and write exists for four lines of git.
+
+**Why not split further.** The flow is sequential, so `needs:` between dependent jobs does not parallelise anything, it serialises them and adds roughly 30 seconds of runner allocation per split. Each job also starts with an empty Docker daemon, so the image does not survive the boundary. Keeping build, test, publish and deploy in one job is what allows the smoke test, the jar extraction and the push to all operate on the same object.
+
+**What the split costs.** About a minute of billable time, since GitHub rounds each job up, and a slightly wider window between `docker push` and `git tag`.
+
+```bash
+git tag "v$VERSION"
+git push origin "v$VERSION"
+```
+
+Last, so a failure anywhere earlier leaves no release recorded. A failed tag push is a hard failure rather than `|| true`: a tag that already exists means something unexpected happened and the run should say so. `git tag -f` is not used, because a tag that moves is the mechanism behind the `tj-actions/changed-files` attack.
+
+`v$VERSION` creates a ref under `refs/tags/`, outside the branch the ruleset protects, so this needs no bypass.
+
+### Dry run
+
+```yaml
+workflow_dispatch:
+  inputs:
+    dry_run:
+      type: boolean
+      default: true
+```
+
+`ci.yml` cannot be exercised by a pull request without publishing, so the manual trigger runs the full path against a scratch registry instead. The `REPO` expression appends `-ci`, and the `tag` job is skipped. Everything else runs for real: version computation, build, smoke test, push, pull, kind deployment, promotion.
+
+**Usage:** Actions → CI → Run workflow, select the branch under "Use workflow from", leave dry run checked.
+
+**What stays untested:** the four lines of `git tag`. There is no reversible way to exercise them, which is a known limitation rather than an oversight.
+
+## 8 PR check
+
+[pr.yml](.github/workflows/pr.yml)
+
+`ci.yml` asks whether a commit is fit to publish. `pr.yml` asks whether a branch is fit to merge. Only the first one publishes, and separating them is what allows every pull request to be built and deployed without producing a version.
+
+It is registered in the ruleset as a required status check under the job name `pr-check`. GitHub matches required checks by job name, so renaming the job without updating the ruleset leaves the check permanently "expected" and blocks every pull request.
+
+### What it does
+
+```yaml
+on:
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+```
+
+Lint the chart, build the image with `APP_VER=0.0.0-pr`, smoke test it, create a kind cluster, deploy. Same checks as `ci.yml`, same Dockerfile, same chart.
+
+**What it does not do:** compute a version, push to Docker Hub, or create a tag. No `setup-java` either, since nothing here reads the pom.
+
+`permissions: {}` at workflow level and `contents: read` on the job, which is all `actions/checkout` needs.
+
+`cancel-in-progress: true`, the opposite of `ci.yml`. `pull_request` fires on `synchronize` as well as `opened`, so pushing another commit starts a new run. The previous one is now testing code nobody will merge, and killing it costs nothing because it publishes nothing. In `ci.yml` a cancelled run could leave a published image untagged, which is why that one waits instead.
+
+### Loading the image without a registry
+
+```bash
+kind load docker-image "$IMAGE" --name pr
+```
+
+Moves the image from the runner's Docker daemon straight into the cluster's nodes, with no registry involved.
+
+`ci.yml` deliberately does not do this: there, pulling from Docker Hub *is* the evidence, proving the published image is complete and reachable. In a pull request there is no published image and nothing to prove about the registry, so loading directly is both faster and the only option.
+
+### Cache read-only
+
+```yaml
+cache-from: type=gha
+```
+
+No `cache-to`. Reads the cache `main` builds, writes nothing back. The layers produced here come from a different `APP_VER`, so they would never be a hit for a release build, and writing them would only consume the cache budget and evict layers that are useful.
+
+## 9 Helm chart
+
+### Workload
+
+`Job`, not `Deployment`. The program prints a line and exits. A `Deployment` requires `restartPolicy: Always`, so Kubernetes would restart the container on a clean `exit 0`, again and again, and report `CrashLoopBackOff` for a program that never failed.
+
+Rewriting the application to loop forever was rejected: that adapts the program to the tool instead of picking the right tool.
+
 
 ### Choosing which version to deploy
 
-The version is set as `appVersion` in `Chart.yaml`, and `values.yaml` holds an
-empty `image.tag`. The template uses the tag when one is given and falls back to
-`appVersion` when it isn't:
+`values.yaml` holds an empty `image.tag`, and the template falls back to `appVersion` from `Chart.yaml` when none is given:
 
 ```yaml
 image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
@@ -956,15 +1083,26 @@ different one would mean editing, committing and merging a file. Together the
 chart has a sensible default that is recorded in git, and an escape hatch for
 everything else.
 
-### Chart version bump
+### appVersion is not updated automatically
 
-The pipeline updates `appVersion` alongside the pom version on every release, so
-the chart's default always points at the most recent published image rather than
-drifting behind it.
-- Updating the chart thru the pipline is possible by taking the new app version and adding it to the Chart.yaml file           
-`sed -i "s/^appVersion:.*/appVersion: \"$NEW\"/" ../chart/Chart.yaml`        
-- Then the change is commited to git with the pom.xml file       
-`git add myapp/pom.xml chart/Chart.yaml`
+`appVersion` is a fixed `1.0.0`, and the pipeline never writes to it.
+
+An earlier version updated it with `sed` alongside the pom and committed both. That mechanism is gone with the commit-back approach (section 1), and there is nothing left to update it: a `sed` on the runner would edit a file that is discarded when the job ends.
+
+The pipeline passes `--set image.tag` at install time instead, which sits at the top of Helm's value precedence. `appVersion` remains the default for a manual `helm install ./chart` with no flags, and is raised by hand when `MAJOR` or `MINOR` moves in the pom.
+
+### Deployment in the pipeline
+
+Every run deploys, in a kind cluster created inside the runner:
+
+```bash
+helm install hello chart/ \
+  --set image.repository="$REPO" \
+  --set image.tag="$VERSION" \
+  --wait --wait-for-jobs --timeout 3m
+```
+
+The cluster starts empty, so the image is pulled from Docker Hub rather than loaded locally, which makes the deployment a real test of what was published. `helm template` runs first as a guard, verifying the chart renders the expected image reference before anything is installed. Section 7 covers both.
 
 ### Folder structure
 
@@ -979,8 +1117,8 @@ drifting behind it.
 - `name: maven-hello-world` - the chart name
 - `description: Hello World Java app deployed as a Kubernetes Job` - the chart description
 - `type: application` - chart type
-- `version: 0.1.0` - the chart version, changes when we change the chart not the app.
-- `appVersion: "1.0.2"` - the app version that runs inside the cluster
+- `version: 0.1.0` - the chart version, changes when the chart changes, not the app
+- `appVersion: "1.0.0"` - the default app version, used only when no `--set image.tag` is given
 
 ### chart/Values.yaml
 
@@ -992,7 +1130,7 @@ drifting behind it.
 - `kind: Job` - uses a job workload the reason for that is explaind in the workload part
 - `name: {{ .Release.Name }}` - uses the name we gave in the install command as the name of the relase
 - `ttlSecondsAfterFinished: 300` - delete the job 300 seconds after the job is done
-- `restartPolicy: Never` - done try to reload the pod after the job has ended (the other optin is OnFailure and is not comptabile with the use case here)
+- `restartPolicy: Never` - do not restart the pod after the job has ended. The other option is `OnFailure`, which is not compatible with this use case
 - `image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"`      
 {{ .Values.image.repository }} - uses the image.repostery name from the chart/Values.yaml file.         
 {{ .Values.image.tag | default .Chart.AppVersion }} - takes the version either from the --set command in the cli or the values.yaml file if nither xsist takes it from Chart.yaml

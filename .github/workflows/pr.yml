@@ -30,8 +30,7 @@ jobs:
               uses: docker/setup-buildx-action@v3
 
             - name: Smoke test
-              env:
-                  IMAGE: ${{ env.REPO }}:${{ steps.version.outputs.new }}
+
               run: |
                   echo "--- entrypoint check ---"
                   docker run --rm "$IMAGE"

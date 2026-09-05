@@ -1,0 +1,30 @@
+name: PR
+
+on:
+    pull_request:
+        branches: [main]
+
+permissions: {}
+
+concurrency:
+    group: pr-${{ github.event.pull_request.number }}
+    cancel-in-progress: true
+
+jobs:
+    pr-check:
+        runs-on: ubuntu-22.04
+        timeout-minutes: 15
+        permissions:
+            contents: read
+        env:
+            IMAGE: maven-hello-world:pr
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Lint chart
+              run: helm lint chart/
+
+            - name: Set up Buildx
+              uses: docker/setup-buildx-action@v3

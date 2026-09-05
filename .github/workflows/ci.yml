@@ -170,6 +170,22 @@ jobs:
 
                   kubectl logs job/hello
 
+            - name: Job summary
+              env:
+                  OLD: ${{ steps.version.outputs.old }}
+                  VERSION: ${{ steps.version.outputs.new }}
+              run: |
+                  {
+                    echo "## Build $VERSION"
+                    echo ""
+                    echo "| | |"
+                    echo "|---|---|"
+                    echo "| Version | \`$OLD\` → \`$VERSION\` |"
+                    echo "| Image | \`$REPO:$VERSION\` |"
+                    echo "| Jar | \`myapp-$VERSION.jar\` |"
+                    echo "| Deployed | verified on kind |"
+                  } >> "$GITHUB_STEP_SUMMARY"
+
     tag:
         needs: build
         runs-on: ubuntu-22.04
@@ -189,3 +205,8 @@ jobs:
                   git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
                   git tag "v$VERSION"
                   git push origin "v$VERSION"
+
+            - name: Job summary
+              env:
+                  VERSION: ${{ needs.build.outputs.version }}
+              run: echo "## Released \`v$VERSION\`" >> "$GITHUB_STEP_SUMMARY"

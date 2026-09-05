@@ -6,7 +6,21 @@ runtime, Docker Hub publishing, and Kubernetes deployment via Helm to a kind clu
 
 Forked from ido83/maven-hello-world - https://github.com/ido83/maven-hello-world
 
----
+
+
+## Contents
+
+1. [Overview](#1-overview) — pipeline flow and versioning strategy
+2. [Understanding the Repository](#2-understanding-the-repository) — Java, Maven, the lifecycle, pom.xml
+3. [Setup](#3-setup) — prerequisites, credentials, permissions, branch protection
+4. [Code Changes](#4-code-changes) — pom.xml, .gitignore, App.java
+5. [Local Build](#5-local-build)
+6. [Dockerfile](#6-dockerfile) — multistage build, non-root runtime, cache behaviour
+7. [Workflow](#7-workflow) — ci.yml, step by step
+8. [PR check](#8-pr-check) — pr.yml and the required status check
+9. [Helm chart](#9-helm-chart) — workload, versioning, deployment
+
+
 
 ## 1. Overview
 

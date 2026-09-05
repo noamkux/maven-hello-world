@@ -6,7 +6,7 @@ on:
     workflow_dispatch:
 
 permissions:
-    contents: write
+    contents: read
 
 concurrency:
     group: release-${{ github.ref }}
@@ -16,6 +16,8 @@ jobs:
     build:
         runs-on: ubuntu-22.04
         timeout-minutes: 20
+        outputs:
+            version: ${{ steps.version.outputs.new }}
         env:
             REPO: ${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world
 
@@ -148,9 +150,20 @@ jobs:
 
                   kubectl logs job/hello
 
+    tag:
+        needs: build
+        runs-on: ubuntu-22.04
+        timeout-minutes: 5
+        permissions:
+            contents: write
+
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
             - name: Tag the release
               env:
-                  VERSION: ${{ steps.version.outputs.new }}
+                  VERSION: ${{ needs.build.outputs.version }}
               run: |
                   git config user.name "github-actions[bot]"
                   git config user.email "41898282+github-actions[bot]@users.noreply.github.com"

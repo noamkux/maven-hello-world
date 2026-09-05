@@ -1,12 +1,26 @@
 # maven-hello-world — CI/CD Pipeline
 
-A Java/Maven "Hello World" application with a fully automated GitHub Actions
-pipeline: automatic patch version bumping in pom.xml, multistage Docker build, non-root
-runtime, Docker Hub publishing, and Kubernetes deployment via Helm.
+A Java/Maven "Hello World" application with fully automated GitHub Actions
+pipelines: automatic patch version bumping using git tags, multistage Docker build, non-root
+runtime, Docker Hub publishing, and Kubernetes deployment via Helm to a kind cluster.
 
 Forked from ido83/maven-hello-world - https://github.com/ido83/maven-hello-world
 
----
+
+
+## Contents
+
+1. [Overview](#1-overview) — pipeline flow and versioning strategy
+2. [Understanding the Repository](#2-understanding-the-repository) — Java, Maven, the lifecycle, pom.xml
+3. [Setup](#3-setup) — prerequisites, credentials, permissions, branch protection
+4. [Code Changes](#4-code-changes) — pom.xml, .gitignore, App.java
+5. [Local Build](#5-local-build)
+6. [Dockerfile](#6-dockerfile) — multistage build, non-root runtime, cache behaviour
+7. [Workflow](#7-workflow) — ci.yml, step by step
+8. [PR check](#8-pr-check) — pr.yml and the required status check
+9. [Helm chart](#9-helm-chart) — workload, versioning, deployment
+
+
 
 ## 1. Overview
 
@@ -20,13 +34,13 @@ Forked from ido83/maven-hello-world - https://github.com/ido83/maven-hello-world
 ### Pipeline flow
 
 ```
-merge PR to main
+push to main
       |
       v
-  read version from pom.xml  ->  bump patch  ->  versions:set
+  read MAJOR.MINOR from pom.xml  ->  find highest matching git tag  ->  bump patch
       |
       v
-  multistage docker build  (pom already carries the new version)
+  multistage docker build  (version injected as --build-arg APP_VER)
       |
       v
   smoke test  (entrypoint + non-root)
@@ -34,112 +48,61 @@ merge PR to main
       +--> extract jar from image  ->  upload as build artifact
       |
       v
-  push image to Docker Hub  (jar version + latest)
+  push image to Docker Hub  (version tag only)
       |
       v
   pull the pushed image and run it
       |
       v
-  commit the pom and tag the release  (v1.0.1)
+  deploy to a kind cluster with Helm
+      |
+      v
+  promote :latest
+      |
+      v
+  tag the release  (v1.0.1)
 ```
 
-The commit and tag are created last, after the image has been built, verified,
-published, pulled and run. A failure anywhere earlier leaves the repository
-untouched, so the version sequence has no gaps for builds that never produced an
-image.
+**Three writes leave the runner**, in ascending order of what a failure costs. `:VERSION` goes first, because the kind deployment pulls it from Docker Hub - that pull is what proves the published image is the one that runs.       
+A version tag of a build that later fails deployment is harmless: nothing points at it and
+nothing resolves to it by accident. `:latest` moves only after the deploy succeeds, since it is the tag people pull without thinking.        
+The `git tag` is created last, so the release record exists only for an artifact that was proven
+end to end.
+
 
 ### Versioning Strategy
 
-Two approaches were implemented during this project. The second replaced the
-first, and was then reverted after a review raised a problem it did not solve.
+The assignment requires a jar at `1.0.0` whose patch component then increments automatically on every build.       
+That is one number that has to live somewhere and move.      
+There are three places it can live.
 
-**The requirement.** Task 5.2 sets the jar version to `1.0.0`, task 6.1
-increases the patch part of *that* version automatically. They are one
-requirement in two steps: a number that lives in the project and moves.
+**A — the pom is the source of truth.** The pipeline reads the version, bump it, writes it back with `versions:set`, and commits the modified pom.
 
-#### Option A — the version lives in pom.xml (chosen)
+**B — git tags are the source of truth.** The pom holds a placeholder such as `0.0.0-SNAPSHOT`, and the pipeline derives the version from the latest tag.
 
-`mvn help:evaluate` reads the current version, the patch is incremented,
-`mvn versions:set` writes it back, and the pipeline commits the modified pom and
-tags the commit.
+**C — split by who decides.** The pom declares `MAJOR.MINOR` and never changes in CI.       
+Tags carry `PATCH`. The pipeline reads the series from the pom, finds the highest tag in it, and adds one.
 
-The version is read with `help:evaluate` rather than grepped out of the XML: this
-pom contains ten `<version>` elements, most of them plugin versions, and
-`help:evaluate` asks Maven for the effective project version after inheritance
-and property resolution.
+**Chosen: C.**
 
-**For:**
+**Why not A.** It requires the pipeline to write to a protected branch, which means a bypass entry on the ruleset for an automated identity — a permission no human contributor to this repository has.      It also creates a trigger loop needing `[skip ci]`, a race between overlapping runs reading the same pom, and automated commits in the history.     
+All three were hit in practice before the approach was
+dropped.
 
-- It is what the exercise asks for. The version is in the file, visible, and the
-  mechanism is demonstrated by running the pipeline twice and reading one line.
-- **A developer who clones the repository knows what version they have.** This is
-  the argument that decided it. `mvn package` on a fresh clone produces
-  `myapp-1.0.7.jar`, matching the published image. The IDE shows the real
-  version, a consuming project resolves the right artifact, and tools that read
-  the pom report accurately.
+**Why not B.** The pom stops stating anything true. A developer who clones the repository sees a placeholder, builds a placeholder jar, and has no way to know from the working tree what the current release is.      
+The pom is the file every tool in the Java ecosystem treats as the project's identity.
 
-**Against, measured rather than assumed:**
+**Why C works.** The pom is not pretending to be the version — it declares the series, which is exactly what it is authoritative about.       
+`MAJOR` and `MINOR` are human decisions, edited by hand in the file that records decisions.      
+`PATCH` is a mechanical count of releases, kept where releases are already recorded.      
+Nothing writes to `main`, so no bypass, no loop, no race.
 
-- It invalidates the Docker layer cache every run. BuildKit hashes each layer
-  against the result of the layers before it, so the dependency layer's key
-  includes the output of `COPY myapp/pom.xml`. Rewriting one character changes
-  that file's hash entirely and invalidates `dependency:go-offline` beneath it,
-  re-downloading every Maven dependency.
-- It requires writing to a protected branch — a bypass entry for
-  `github-actions[bot]` on the ruleset.
-- It creates a trigger loop, mitigated with `[skip ci]`.
-- It leaves automated commits in the history.
+**The version still reaches the artifact.** It is passed to the build as `--build-arg APP_VER` and applied by `versions:set` *inside* the Dockerfile, after the dependency layer. The jar is therefore built from the real pom and `META-INF/maven/com.myapp/myapp/pom.properties` carries the released version.
+Section 6 covers why the `ARG` sits where it does.
 
-#### Option B — the version lives in git tags
-
-The pom holds `<version>${revision}</version>` defaulting to `0.0.0-SNAPSHOT`,
-using Maven's CI-Friendly Versions mechanism. The pipeline reads the latest tag
-with `git describe`, increments the patch, and injects the result as
-`--build-arg REVISION` — declared in the Dockerfile *after* the dependency layer,
-so a version change does not invalidate it.
-
-This was fully implemented and measured:
-
-| Build | Total | `dependency:go-offline` |
-|---|---|---|
-| First build, cold | 73.8s | 69.0s |
-| Version-only change | **5.0s** | **CACHED** |
-
-Under Option A the second build takes roughly 70 seconds again. Option B also
-needs no write to the branch, no bypass, no trigger loop, and leaves no automated
-commits — three concrete advantages against one.
-
-**Why it was not kept:** the pom no longer states the real version. A developer
-cloning the repository sees `0.0.0-SNAPSHOT`, builds `myapp-0.0.0-SNAPSHOT.jar`,
-and has no way to know from the working tree that the current release is `1.0.7`.
-Only `git tag -l` reveals it. The pom is accurate only inside the pipeline — the
-one place nobody reads it.
-
-That is not a presentation problem. The pom is the file every tool in the Java
-ecosystem treats as the project's identity, and under Option B it is wrong on
-every machine except the CI runner.
-
-#### Reordering was considered and does not help
-
-Building first and updating the pom only at the end keeps the pom stable *during*
-a run — but the next run still sees a changed file, so the `COPY` layer breaks
-anyway. Once the version lives in a file under version control, that layer changes
-every release regardless of when in the pipeline it is written. It is a
-consequence of the approach, not of the ordering.
-
-#### The decision
-
-Option A, accepting roughly 69 seconds of rebuild per run. The exercise asks for a
-version in the project that increments, and a developer reading the repository
-should see the same number the registry does. A faster pipeline that reports the
-wrong version solves a different problem.
-
-Git tags are still created, so the version has two synchronised representations:
-the pom defines it, the tag records it in history.
-
-The caching penalty is real but small at this scale, and it is a performance cost
-rather than a correctness one. Section 12 covers how it would be removed where it
-mattered.
+**Measured.** A build with a new version took **83.1s** under A and **20.1s**
+under C. The difference is the `dependency:go-offline` layer, 61.8s, which stays
+cached because the pom no longer changes between runs.
 
 ---
 
@@ -457,6 +420,9 @@ kubectl  1.29+
 Helm  3.x  
 minikube for Local cluster for the deployment step 
 
+Helm 3.5 is the floor because of `--wait-for-jobs`, added in that release. A local cluster is optional: the pipeline creates its own kind cluster on the runner, so nothing here is needed to run CI.
+
+
 ### Fork & clone
 
 ```bash
@@ -465,12 +431,10 @@ cd maven-hello-world
 ```
 ### Docker Hub
 
-A public repository at noamkux/maven-hello-world.
+Two public repositories: `noamkux/maven-hello-world` for releases, and `noamkux/maven-hello-world-ci` for dry runs (section 7).
 
-Public was a deliberate choice, for two reasons: the pipeline's final step pulls
-and runs the image, which needs no authentication when the repository is public,
-and the Helm deployment needs no `imagePullSecret`. A private repository would
-have added an authentication step in both places for no benefit here.
+Public was a deliberate choice, for two reasons: the pipeline's final step pulls and runs the image, which needs no authentication when the repository is public, and the Helm deployment needs no `imagePullSecret`. 
+A private repository would have added an authentication step in both places for no benefit here.
 
 ### Credentials — secrets vs. variables
 
@@ -491,34 +455,19 @@ individually without touching the account.
 ### Workflow permissions
 
 ```yaml
-permissions: {}
+permissions:
+  contents: read
 ```
 
-The workflow declares no permissions at all. `GITHUB_TOKEN` is still generated
-and injected into every run — that cannot be switched off — but an empty block
-sets every scope to `none`, so the token can do nothing.
+`GITHUB_TOKEN` is created for every run whether or not it is used, so the only question is what it may do. The block is declared rather than omitted: an absent block inherits the repository default from **Settings → Actions → General**, a setting that is not in git, is not reviewed, and does not travel with a fork.
 
-the pipline use deploy keys to checkout and push to the repo, by usuing this method
-every later git command in the workspace goes over SSH. The token is never
-involved in the push so there is now reason to give it any permissions.
-
-`permissions: {}` rather than removing the block: an absent block inherits the
-repository default from **Settings → Actions → General**, which grants write
-across every scope. Removing it is the widest option available, not the
-narrowest, and it moves the decision into a settings screen that is not in git,
-is not reviewed, and does not travel with a fork.
+`contents: read` is what `actions/checkout` needs and nothing more. The `tag` job re-declares `contents: write`, and a job-level block **replaces** the workflow-level one rather than adding to it, so that job has write on contents and nothing elsewhere, while everything in `build` (including every third-party action) stays read-only. Permissions exist at workflow and job level only, never per step, so splitting the tag into its own job is what makes this granularity possible.
 
 ### Branch protection
 
-`main` is protected by a repository ruleset: pull requests required, force pushes
-blocked, deletions blocked. Required approvals is 0 — a single-contributor
-repository cannot satisfy a review requirement, and a rule that cannot be met is
-a rule that gets bypassed.
+`main` is protected by a repository ruleset: pull requests required, force pushes and deletions blocked, and `pr-check` required as a status check. Required approvals is 0, because a single-contributor repository cannot satisfy a review requirement, and a rule that cannot be met is a rule that gets bypassed.
 
-to let the runner push to the repo (tags and the updated pom file) i have
-created a deploy key for the runner.
-the deploy key is allowd to push to repo in the ruleset, the key itself is saved as a secret
-in github and injected to the runner in the ci.yml file.
+**The bypass list is empty, including for Actions.** Nothing in the pipeline writes to `main`. The only write is `git push origin "v$VERSION"`, which creates a ref outside the protected branch, so the automation is subject to the same rule as a human contributor.
 
 ## 4. Code Changes
 
@@ -619,23 +568,26 @@ Use an explicit maven version and name it as build for future multistage use
 `WORKDIR /build`      
 Create a workdir for the build named "build"
 
-`COPY myapp/pom.xml .`       
-Copy only the pom.xml file, this file doesn't change as often
-so this layer and the run command won't rerun
-in every build, this will improve the performance of the build.
+`COPY myapp/pom.xml .`
+Copy the pom on its own. The pom never changes in CI (section 1), so this layer is a permanent cache hit and everything under it survives.
 
-`RUN mvn -B -e dependency:go-offline`      
-Use the -B flag to run in batch mode (no user input needed), -e shows the full error if there is any
-dependency:go-offline uses the dependency plugin and sets the goal of go-offline.
-This will allow downloading all the needed dependencies to a cache layer and improve the performance of the Dockerfile.
+`RUN mvn -B -e -ntp dependency:go-offline`
+Resolves and downloads the dependencies into the image. `-B` is batch mode (no progress bars, no interactive prompts), `-e` prints full stack traces on failure, `-ntp` hides the transfer log. This is the expensive layer, 61.8s cold, and keeping it cached is the reason the pom is copied separately.
 
-`COPY myapp/src ./src`       
-Copy the source code, this separation is what makes the caching of the dependencies valuable,
-because this layer can change frequently
+The goal is not a guarantee of an offline build. It resolves declared dependencies and the plugins the lifecycle binds, but misses plugins invoked by hand. Verified: adding `-o` to the build fails on `versions-maven-plugin`, which this layer never fetched. It is a warm cache, not an offline guarantee.
 
+`COPY myapp/src ./src`
+The source, copied after the dependencies. This is the layer that actually changes between builds.
 
-`RUN mvn -B package`       
-Use maven to package the app, maven will run until the package phase in the default lifecycle.
+`ARG APP_VER=0.0.0`
+The version, injected by the pipeline as `--build-arg APP_VER=1.0.18`.
+
+**Its position is the point.** BuildKit treats an `ARG` declaration as a layer, so changing the value invalidates only what is below it. Declared at the top of the file, every version bump would invalidate the dependency download. Declared here, a new version rebuilds two cheap layers: 83.1s before, 20.1s after.
+
+`RUN mvn -B -ntp versions:set -DnewVersion="$APP_VER" -DgenerateBackupPoms=false package`
+Writes the version into the pom inside the image, then builds. Because the jar is packaged from the real pom, `pom.properties` carries the released version and the artifact does not misreport itself. `-DgenerateBackupPoms=false` suppresses the `pom.xml.versionsBackup` file the plugin writes by default.
+
+No `clean`: the layer is created fresh on every run, so there is nothing to clean. `clean` is still correct locally, where `target/` persists between
 
 `FROM eclipse-temurin:17.0.13_11-jre-alpine`      
 The start of a new stage using the JRE Alpine image. This image will be the
@@ -653,8 +605,8 @@ the two commands are chained.
 `WORKDIR /app`      
 Create a new workdir for the runtime
 
-`COPY --from=build --chown=app:app /build/target/myapp-*.jar /app/app.jar`      
-Copy only the jar from the build stage, creating a smaller image and less attack surface
+`COPY --from=build --chown=10001:10001 /build/target/myapp-*.jar /app/app.jar`
+Copy only the jar out of the build stage, leaving the JDK, Maven and `~/.m2` behind. The ownership is set numerically for the same reason `USER` is, below.
 
 `USER 10001:10001`      
 Use the user to the user we created in the previous command.
@@ -717,27 +669,23 @@ layers rerun, the pom and dependency layers stay cached.
 **Change the version**
 
 ```bash
-cd myapp && mvn versions:set -DnewVersion=1.0.1 -DgenerateBackupPoms=false && cd ..
-docker build -t maven-hello-world:1.0.1 .
+docker build --build-arg APP_VER=1.0.1 -t maven-hello-world:1.0.1 .
 ```
 
 ```
-=> [build 3/6] COPY myapp/pom.xml .
-=> [build 4/6] RUN mvn -B -e dependency:go-offline
+=> CACHED [build 3/7] COPY myapp/pom.xml .
+=> CACHED [build 4/7] RUN mvn -B -e -ntp dependency:go-offline
+=> CACHED [build 5/7] COPY myapp/src ./src
+=> [build 6/7] RUN mvn -B -ntp versions:set -DnewVersion="1.0.1" ... package
 ```
 
-**Note that both rebuild.** Changing the pom invalidates the `COPY` layer, and
-everything below it goes with it — including the 69-second dependency download.
-This is the measured cost of keeping the version in the pom, discussed in the
-Versioning Strategy section above.
-
-**Check the running user inside the continer is not root**
+Only the build layer reruns. The dependency download stays cached because nothing above the `ARG` changed, which is the whole argument for where it sits.
 
 ```bash
 docker run --rm --entrypoint id maven-hello-world:1.0.0
 ```
 ```bash
-uid=100(app) gid=101(app) groups=101(app)
+uid=10001(app) gid=10001(app) groups=10001(app)
 ```
 ***
 **Check the image size**
@@ -750,247 +698,378 @@ should return a size of 250 MB
 
 ## 7 Workflow
 
-Create a ci.yml file.
+Two workflows, with different questions and different privileges.
 
-[ci.yml](/maven-hello-world/.github/workflows/ci.yml)
+| | `pr.yml` | `ci.yml` |
+|---|---|---|
+| Asks | is this fit to merge? | is this fit to publish? |
+| Triggers on | `pull_request` to `main` | `push` to `main`, or manual dispatch |
+| Computes a version | no | yes |
+| Publishes | no | yes |
 
-```bash
-cd ~/github/maven-hello-world
-mkdir -p .github/workflows
-cd .github/workflows
-touch ci.yml
+Section 8 covers `pr.yml`. This section is `ci.yml`.
+
+[ci.yml](.github/workflows/ci.yml)
+
+### Trigger
+
+```yaml
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - ".gitignore"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Publish to the scratch repo and skip tagging"
+        type: boolean
+        default: true
 ```
 
-### Trigger & Permissions
+Since `main` only accepts merges, `push` to `main` means "a pull request was merged". `paths-ignore` keeps a documentation edit from producing a release: a new version number should mean the artifact changed.
 
-**trigger :** The pipline will triger only on push to the main branch and on manual dispatch.
+`workflow_dispatch` adds the dry run, covered at the end of this section.
 
+**timeout-minutes: 20.** The default is 360, six hours of runner time before a hung `docker pull` or a stalled Maven download is cut off. A normal run finishes in 3 to 5 minutes.
 
-**permissions :** `permissions: {}` — no scopes at all. `GITHUB_TOKEN` is
-created for every run regardless of whether it is used, so the empty block is
-what reduces it to `none` everywhere. The pipeline pushes over SSH with a deploy
-key and never touches the token. Full reasoning in section 3.
+### Concurrency
 
-**timeout-minutes :** `20`. The default is 360 — six hours of runner time
-before a hung `docker pull` or a stalled Maven download is cut off. A normal run
-finishes in 3–5 minutes, so this leaves room without being theoretical.
+```yaml
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+```
+
+Two merges landing close together would otherwise run in parallel, read the same highest tag, and compute the same version. `cancel-in-progress: false` is the important half: the second run waits instead of replacing the first, because a run that is midway through publishing an image should finish and record its tag rather than be killed halfway.
 
 ### Job-level variables
 
-`REPO` is declared once in the job's `env` block and used by every step that
-references the image:
-
 ```yaml
 env:
-    REPO: ${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world
+  REPO: ${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world${{ inputs.dry_run && '-ci' || '' }}
 ```
 
-The `env` context is available both in `with:` blocks and in shell steps, so one
-declaration covers the build action and the scripts alike. `VERSION` cannot live
-there — the `steps` context does not exist at job level, since step outputs are
-produced during the run — so it is declared per step instead.
+Declared once and used by every step that names the image.
+The suffix is what routes a dry run to the scratch repository. On a `push` trigger `inputs.dry_run` does not exist, evaluates as falsy, and the expression yields the release repository.
+
 
 ### Checkout
 
- - runs-on - settings the VM OS to ubuntu 22.04, usuing a specific version and not latest to ensure consistency
- - Checkout - uses the action : `actions/checkout@v4` which clones the repo to the runner.
- - Set up JDK 17 - uses `actions/setup-java@v4` with `distribution: temurin`, the
-   same distribution as both Docker base images. The runner compiles nothing, but
-   `help:evaluate` and `versions:set` run there and need Maven.
+```yaml
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0
+    filter: tree:0
+```
+
+`runs-on: ubuntu-22.04` rather than `ubuntu-latest`, so a runner image update cannot change the build under you.
+
+`fetch-depth: 0` fetches the full history, because the default shallow clone brings no tags and the version is computed from them.     
+`filter: tree:0` makes it a blobless clone: all commits and all refs, none of the file contents, fetched lazily only if something asks for them. Nothing here does, since the version comes from ref names alone.
 
 ### Determine next version
 
-Reads the current version, validates it, and computes the next one. This step
-only calculates — nothing is written here.
-
-- `CURRENT=$(mvn -B -q help:evaluate -Dexpression=project.version -DforceStdout)` —
-  asks Maven for the effective project version. Not `grep`: this pom has ten
-  `<version>` elements and only one of them is the project's. `-q` silences the
-  logs and `-DforceStdout` forces a clean value to stdout.
-
-- The format is validated before anything is parsed:
+Reads the series from the pom, finds the highest tag in it, and adds one. This step only calculates.
 
 ```bash
+CURRENT=$(mvn -B -q -ntp help:evaluate -Dexpression=project.version -DforceStdout)
+
 [[ "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
   echo "::error::unexpected version format: '$CURRENT' (expected X.Y.Z)"
   exit 1; }
 ```
 
-  Without this guard the arithmetic below does not fail on malformed input, it
-  produces a wrong answer. Bash evaluates an empty or non-numeric variable as `0`
-  in arithmetic context, so `1.0` yields `1.0.1` with a patch component that
-  never existed, and `1.0.0-SNAPSHOT` yields `1.0.1` — silently turning a
-  development version into a release.
+`help:evaluate` rather than grepping the XML: this pom holds ten `<version>` elements and only one is the project's. It asks Maven for the effective version after inheritance and property resolution. `-q` silences the logs, `-DforceStdout` puts a clean value on stdout.
 
-
-- Once the guard passes, `CURRENT` is known to be three numeric fields, so the
-  split and the increment are operating on a validated string:
+The guard exists because bash arithmetic does not fail on malformed input, it produces a wrong answer. An empty or non-numeric field evaluates as `0`, so `1.0` would yield a patch component that never existed and `1.0.0-SNAPSHOT` would silently become a release.
 
 ```bash
 MAJOR=$(echo "$CURRENT" | cut -d. -f1)
 MINOR=$(echo "$CURRENT" | cut -d. -f2)
-PATCH=$(echo "$CURRENT" | cut -d. -f3)
-NEW="$MAJOR.$MINOR.$((PATCH + 1))"
+LAST=$(git tag -l "v$MAJOR.$MINOR.*" --sort=-v:refname | head -n1)
+
+if [ -z "$LAST" ]; then
+  PATCH=0
+  OLD="none"
+else
+  PATCH=$(( $(echo "$LAST" | cut -d. -f3) + 1 ))
+  OLD="${LAST#v}"
+fi
+
+NEW="$MAJOR.$MINOR.$PATCH"
 ```
 
-  `-d.` sets the delimiter, `cut` fields are numbered from 1. 
+The glob restricts the search to the series the pom declares, so raising the pom to `2.0.0` starts a fresh count without touching the `v1.0.*` tags. `--sort=-v:refname` is a version sort, not a lexicographic one: the default ordering puts `v1.0.9` above `v1.0.17`. `${LAST#v}` strips the leading `v`.
 
-- Both values are published as step outputs:
+`PATCH=0` when the series is empty, so `2.0.0` in the pom releases as `2.0.0`. Changing `MAJOR` or `MINOR` is a statement about which version this is, not a starting point for the next one.
+
+```bash
+git rev-parse "v$NEW" >/dev/null 2>&1 && {
+  echo "::error::v$NEW already exists in git — version computation is broken"
+  exit 1; }
+
+for _ in $(seq 1 20); do
+  docker manifest inspect "$REPO:$NEW" >/dev/null 2>&1 || break
+  echo "::warning::$REPO:$NEW is already published but has no git tag — skipping"
+  PATCH=$((PATCH + 1))
+  NEW="$MAJOR.$MINOR.$PATCH"
+done
+```
+
+Two guards against reusing a version number, deliberately behaving differently.
+
+The first is impossible if the code is right: the tag was just derived as the highest plus one, so finding it already present means the computation is broken or someone changed the pom.xml version. It fails the run.
+
+The second is a state the system can recover from. A run that published an image and then failed before tagging leaves a number that git does not know about, and the next run would compute it again and overwrite a published image. The loop detects that and moves forward. `git rev-parse` rather than `git tag -l` here, because it returns an exit code instead of matching text.
+
+**The resulting gap in the tags is correct, not a defect.** Git records releases, not builds. A version that was published but never tagged is an artifact that never became a release, and its absence is the accurate record. The computation takes the maximum and adds one, so it never needs the sequence to be continuous.
 
 ```bash
 echo "new=$NEW" >> "$GITHUB_OUTPUT"
-echo "old=$CURRENT" >> "$GITHUB_OUTPUT"
+echo "old=$OLD" >> "$GITHUB_OUTPUT"
 ```
 
-  `$GITHUB_OUTPUT` is an environment variable holding a path to a temp file. At
-  the end of the step the runner publishes each `key=value` line as an output of
-  this step's `id`, reachable as `steps.version.outputs.new`.
+`$GITHUB_OUTPUT` holds a path to a temporary file. At the end of the step the runner publishes each `key=value` line as an output of this step's `id`, reachable as `steps.version.outputs.new` and, through the job's `outputs:` block, as `needs.build.outputs.version` in the `tag` job.
 
 
-### Bump pom.xml
+### Set up Buildx
 
-```bash
-mvn -B versions:set -DnewVersion="$NEW" -DgenerateBackupPoms=false
+`docker/setup-buildx-action@v3` creates a `docker-container` builder. Docker already uses BuildKit by default, but the built-in `docker:default` builder cannot export or import a layer cache, so without this step `cache-to` and `cache-from` do nothing and every run rebuilds from scratch, making the layer ordering in the Dockerfile worthless in CI.
+
+
+### Build image
+
+```yaml
+- uses: docker/build-push-action@v6
+  with:
+    context: .
+    load: true
+    push: false
+    build-args: |
+      APP_VER=${{ steps.version.outputs.new }}
+    tags: ${{ env.REPO }}:${{ steps.version.outputs.new }}
+    cache-from: type=gha
+    cache-to: type=gha,mode=max
 ```
 
-Writes the new version into the pom on the runner. The Docker build that follows
-picks it up automatically, since `COPY myapp/pom.xml` copies the modified file.
+`push: false` with `load: true`: the image is exported from the builder into the local Docker daemon and nothing leaves the runner. Everything that follows tests a real local image, and the push is a separate step later, so exactly the object that passed the checks is the one published.
 
-`-DgenerateBackupPoms=false` suppresses the `pom.xml.versionsBackup` file the
-plugin writes by default. On a runner the working tree is discarded when the job
-ends, and the backup would otherwise have to be excluded from the commit.
+Only the version tag is applied. `latest` is created at the end, after the deployment succeeds.
 
-### Bump helm chart
-
-The chart carries the application version in its own metadata, so the same value
-has to reach two files. `Chart.yaml` is plain YAML with no build tool behind it,
-so this is a text substitution:
-
-```bash
-sed -i "s/^appVersion:.*/appVersion: \"$NEW\"/" chart/Chart.yaml
-grep -q "^appVersion: \"$NEW\"$" chart/Chart.yaml || {
-  echo "::error::failed to update appVersion in chart/Chart.yaml"
-  exit 1; }
-```
-
-`sed` exits `0` whether or not the pattern matched anything — for a stream
-editor, finding nothing to replace is a valid outcome, not an error. Any change
-to how the field is written in `Chart.yaml`, such as indentation or a space
-before the colon, would stop the pattern matching. The run would then finish
-green with the chart still on an old version, and `git add` would find nothing
-to stage, so the commit would succeed too. The mismatch would surface only when
-someone ran `helm install` and got an image they did not expect.
-
-The exit code of `sed` carries no information here because `sed` exits `0` 
-whether or not the pattern matched anything, so the assertion cant happend here.
-To check that the change to the chart was acctualy made grep is used to find 
-the correct line, if not exsisting it will fail the pipeline.
-
-### Buildx
-
-Use the docker/setup-buildx-action@v3 to install buildx, the main reason for using buildx is
-that it creates a `docker-container` builder, which can export and import its layer cache.
-Docker already uses BuildKit by default, but the built-in `docker:default` builder cannot do
-that — so without this step `cache-to` and `cache-from` fail and every CI run rebuilds from
-scratch, making the layer ordering in the Dockerfile worthless in the pipeline.
-
-### Docker login
-
-Use the docker/login-action@v3 to allow communication with docker hub, inject the user name and password from github vars/sercrets (i have enterd those value at step "3 Setup"), it preform a docker login and write the credentials to `~/docker/.config.json`. 
-
-### Build the image
-
-uses the docker/build-push-action@v6 with the follwing arguments
-- push: `false` - after the image is built dont push it to the registry, we want to test first and the push
-- load: `true` - import the image from the builder continer to the docker daemon
-- tags: `${{ env.REPO }}:${{ steps.version.outputs.version }}` - tags the image with the correct version, same as above we got the version from the Determine next version phase
-- `${{ env.REPO }}:latest` a second tag named latest.
-- cache-from: `type=gha` use the cache that is stored at git hub action cache a service that allows to store data outside the VM and call it for futere use, this is what makes our build faster with the usage of caching
-- cache-to: `type=gha,mode=max` - where to cache the data, its the other side of the same coin, the `mode=max` arg tells github to store layers that are not present in the final image 
+`mode=max` caches intermediate layers as well as those in the final image. With a multistage build the default `min` would cache nothing from the build stage, which is where all the expensive work happens.
 
 ### Smoke test
 
-decided to make two checks before uploading the image and the artifact, this check are relvent to the code i wrote in the docker file and not the code the developer wrote
-
-**entrypoint check** - make sure the entry point in the docker file works and dosent return a status code diffrent the 0. it works because github action runs each script with the set -e command which drops the whole pipline if an exit code return a diffrent value then 0
-`docker run --rm "$IMAGE"`
-
-
-**non root user** - run the continer and ask for the user id back, ensure the user is not root
+Two checks on the image, both about the Dockerfile rather than the application code.
 
 ```bash
+docker run --rm "$IMAGE"
+
 RUN_UID=$(docker run --rm --entrypoint id "$IMAGE" -u)
-echo "Running as UID: $RUN_UID"
 [ "$RUN_UID" != "0" ] || {
-  echo "::error::container runs as root", exit 1, }
+  echo "::error::container runs as root"; exit 1; }
 ```
+
+The first verifies the entrypoint resolves and the process exits `0`. Actions runs each script with `set -e`, so a non-zero exit fails the step on its own.
+
+The second checks the effective UID. `--entrypoint id` replaces the entrypoint for this run, and `-u` is passed as an argument to it. This asserts what the base image and `USER` actually produce, rather than trusting that the Dockerfile says what it means.
 
 ### Extract jar from image
 
-- `IMAGE="${{ env.REPO }}:${{ steps.version.outputs.version }}"` - save the image name as a varibale named IMAGE, 
-- `docker create "$IMAGE"` - uses the same image we just build and create a continar with this image, use docker create and not run because we dont need to run the continar we only need to acsses its FS to grab the jar file
-- `docker cp "$CID:/app/app.jar" "./myapp-${{ steps.version.outputs.version }}.jar"` - use docker cp to copy the image from the conatiner FS to the local FS of the runner
-- `docker rm "$CID"` - delete the container 
-- `ls -lh ./myapp-*.jar` to check the file is present
+```bash
+CID=$(docker create "$IMAGE")
+docker cp "$CID:/app/app.jar" "./$JAR"
+docker rm "$CID"
+```
+
+`docker create` builds a container's filesystem without starting it, which is all that is needed to read a file out of it.
+
+Taking the jar from the image rather than building it separately on the runner means the artifact is byte-identical to what runs in production. A second `mvn package` would produce a jar that was probably the same, which is a weaker claim.
 
 ### Upload jar artifact
 
-- `actions/upload-artifact@v4` upload an artifact to git hub, enable to download the artifact directly from github for inspection.
+`actions/upload-artifact@v4`, with `if-no-files-found: error` so a rename or a path change fails loudly instead of uploading nothing.
 
-- `retention-days: 14` overrides the 90-day default. The jar already exists as a
-layer in the published image, so this artifact is a convenience for manual
-inspection rather than an archive, and does not need to outlive the interest in
-a given run.
+`retention-days: 14` overrides the 90-day default. The jar already exists as a layer in the published image, so this is a convenience for inspection rather than an archive.
 
-### Push to Docker hub
-
-use basic shell command to push the image to docker hub with the two tags, one with the jar version and one with latest.
-
-### Pull and run
-
-- use `docker rmi "$IMAGE"` delete the image if exsist in the local FS, ensure consistency for the testing.
-- `docker pull "$IMAGE"` pull the newly created image from docker hub for testing
-
-- `OUTPUT=$(docker run --rm "$IMAGE")` - run the contianer and save the output to a varibale named OUTPUT to print to screen later
-- `echo "$OUTPUT"` - print the result of the docker run
-
-### Commit and tag the release
-
-The last step, so a failure anywhere earlier leaves the repository untouched.
+### Push version tag
 
 ```bash
-git config user.name "github-actions[bot]"
-git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-git add myapp/pom.xml chart/Chart.yaml
-git commit -m "chore: bump version to <version> [skip ci]"
-git tag "v<version>"
-git push origin HEAD:main
-git push origin "v<version>"
+docker push "$REPO:$VERSION"
 ```
 
-- The email with the numeric prefix is the official user ID of
-  `github-actions[bot]`, using it makes GitHub attribute the commit correctly.
-- `git add myapp/pom.xml chart/Chart.yaml` rather than `git add .` — adds the pom.xml file and the Chart.yaml file to the commit because thy are the only one that have been changed.
-- `[skip ci]` breaks the trigger loop, and here it is the only thing that does.
-  The rule that commits pushed with the default `GITHUB_TOKEN` do not trigger
-  workflows applies to that token alone — this push is made over SSH with a
-  deploy key, which GitHub treats as an ordinary push. Without `[skip ci]` the
-  bump commit would trigger the workflow, which would bump, commit and trigger
-  again.
-- `git push origin HEAD:main` rather than `git push` — the Actions checkout is in
-  detached HEAD state, so the target must be named explicitly.
+A plain `docker push` rather than a second call to `build-push-action`. The action would rebuild, and even with a full cache hit that is a weaker claim than pushing the exact object that just passed the smoke test. This pushes the same digest.
 
+Only the version tag goes up here. `latest` waits.
 
-## 8 Helm chart
+### Pull from DockerHub
 
-### workload
-I have used a job workload becuase this program dosent run in a infinite loop, if i will used deployment Kubernetes will restart the continer after the program exists (Deployment restartPolicy have to be always) eventually this will caused a CrashLoopBackOff. 
+```bash
+docker rmi "$REPO:$VERSION"
+docker pull "$REPO:$VERSION"
+docker run --rm "$REPO:$VERSION"
+```
+
+`docker rmi` first is what makes the pull real. Without it the daemon already holds the image, the pull is a no-op, and the step proves nothing. Removing it forces a genuine round trip through the registry, which verifies that what was published is complete and runnable.
+
+This satisfies task 5.7 and is also the last check before anything is deployed.
+
+### Create kind cluster
+
+`helm/kind-action@v1` builds a Kubernetes cluster inside the runner.
+
+**Why not minikube.** Deploying on my own machine proves the chart works on my machine. A cluster created inside the pipeline is evidence attached to the run, reproducible by anyone reading it. minikube would also not work here: the runner has no nested virtualisation, so its default driver has nothing to run on.
+
+The cluster is created empty, which makes the deployment pull from Docker Hub by necessity rather than by configuration. No image is preloaded, so a successful deployment proves the published image is pullable and runnable by a third party.
+
+### Deploy with Helm
+
+```bash
+RENDERED=$(helm template hello chart/ \
+  --set image.repository="$REPO" \
+  --set image.tag="$VERSION" \
+  | grep -oP '^\s*image:\s*"?\K[^"]+')
+
+[ "$RENDERED" = "$REPO:$VERSION" ] || {
+  echo "::error::chart renders $RENDERED, expected $REPO:$VERSION"
+  exit 1; }
+```
+
+The chart falls back to `appVersion` when no tag is given, which is the right default for a manual install and a silent failure in CI. A `--set` that does not arrive would deploy `1.0.0`, run successfully, and leave the pipeline green while having deployed the wrong version.
+
+`helm template` renders locally in a second, before the cluster is involved, so the check runs on what will be sent rather than on what came back.
+
+```bash
+helm install hello chart/ \
+  --set image.repository="$REPO" \
+  --set image.tag="$VERSION" \
+  --wait --wait-for-jobs --timeout 3m
+
+kubectl logs job/hello
+```
+
+`--wait` alone is not enough. It waits for resources to become ready, and for a Job that means created, not finished. `--wait-for-jobs` (Helm 3.5+) waits for completion. Without it `kubectl logs` runs against a pod still in `ContainerCreating`.
+
+`--set image.repository` is passed as well as the tag, so a dry run deploys from the scratch repository rather than from the one named in `values.yaml`.
+
+### Promote latest
+
+```bash
+docker tag "$REPO:$VERSION" "$REPO:latest"
+docker push "$REPO:latest"
+```
+
+`latest` is a moving tag that people pull without thinking. Publishing it alongside the version tag would mean a build that fails to deploy still becomes the default for everyone. Moving it here changes its meaning from "the last thing built" to "the last thing successfully deployed", which is what its users already assume it means.
+
+A tag is a pointer, not a copy, so this push transfers no layers. The registry recognises every digest and writes a new manifest.
+
+The image being tagged is the one pulled back from Docker Hub and deployed, since the local build was removed in the pull step.
+
+### Tag the release
+
+A separate job:
+
+```yaml
+tag:
+  needs: build
+  if: ${{ !inputs.dry_run }}
+  permissions:
+    contents: write
+```
+
+**Why a second job.** `contents: write` is the only elevated permission in the workflow, and permissions exist at workflow and job level only, never per step. In a single job it would apply to every third-party action in the run. Splitting it means `setup-java`, `buildx`, `login-action`, `build-push-action`, `upload-artifact` and `kind-action` all execute read-only, and write exists for four lines of git.
+
+**Why not split further.** The flow is sequential, so `needs:` between dependent jobs does not parallelise anything, it serialises them and adds roughly 30 seconds of runner allocation per split. Each job also starts with an empty Docker daemon, so the image does not survive the boundary. Keeping build, test, publish and deploy in one job is what allows the smoke test, the jar extraction and the push to all operate on the same object.
+
+**What the split costs.** About a minute of billable time, since GitHub rounds each job up, and a slightly wider window between `docker push` and `git tag`.
+
+```bash
+git tag "v$VERSION"
+git push origin "v$VERSION"
+```
+
+Last, so a failure anywhere earlier leaves no release recorded. A failed tag push is a hard failure rather than `|| true`: a tag that already exists means something unexpected happened and the run should say so. `git tag -f` is not used, because a tag that moves is the mechanism behind the `tj-actions/changed-files` attack.
+
+`v$VERSION` creates a ref under `refs/tags/`, outside the branch the ruleset protects, so this needs no bypass.
+
+### Dry run
+
+```yaml
+workflow_dispatch:
+  inputs:
+    dry_run:
+      type: boolean
+      default: true
+```
+
+`ci.yml` cannot be exercised by a pull request without publishing, so the manual trigger runs the full path against a scratch registry instead. The `REPO` expression appends `-ci`, and the `tag` job is skipped. Everything else runs for real: version computation, build, smoke test, push, pull, kind deployment, promotion.
+
+**Usage:** Actions → CI → Run workflow, select the branch under "Use workflow from", leave dry run checked.
+
+**What stays untested:** the four lines of `git tag`. There is no reversible way to exercise them, which is a known limitation rather than an oversight.
+
+## 8 PR check
+
+[pr.yml](.github/workflows/pr.yml)
+
+`ci.yml` asks whether a commit is fit to publish. `pr.yml` asks whether a branch is fit to merge. Only the first one publishes, and separating them is what allows every pull request to be built and deployed without producing a version.
+
+It is registered in the ruleset as a required status check under the job name `pr-check`. GitHub matches required checks by job name, so renaming the job without updating the ruleset leaves the check permanently "expected" and blocks every pull request.
+
+### What it does
+
+```yaml
+on:
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+```
+
+Lint the chart, build the image with `APP_VER=0.0.0-pr`, smoke test it, create a kind cluster, deploy. Same checks as `ci.yml`, same Dockerfile, same chart.
+
+**What it does not do:** compute a version, push to Docker Hub, or create a tag. No `setup-java` either, since nothing here reads the pom.
+
+`permissions: {}` at workflow level and `contents: read` on the job, which is all `actions/checkout` needs.
+
+`cancel-in-progress: true`, the opposite of `ci.yml`. `pull_request` fires on `synchronize` as well as `opened`, so pushing another commit starts a new run. The previous one is now testing code nobody will merge, and killing it costs nothing because it publishes nothing. In `ci.yml` a cancelled run could leave a published image untagged, which is why that one waits instead.
+
+### Loading the image without a registry
+
+```bash
+kind load docker-image "$IMAGE" --name pr
+```
+
+Moves the image from the runner's Docker daemon straight into the cluster's nodes, with no registry involved.
+
+`ci.yml` deliberately does not do this: there, pulling from Docker Hub *is* the evidence, proving the published image is complete and reachable. In a pull request there is no published image and nothing to prove about the registry, so loading directly is both faster and the only option.
+
+### Cache read-only
+
+```yaml
+cache-from: type=gha
+```
+
+No `cache-to`. Reads the cache `main` builds, writes nothing back. The layers produced here come from a different `APP_VER`, so they would never be a hit for a release build, and writing them would only consume the cache budget and evict layers that are useful.
+
+## 9 Helm chart
+
+### Workload
+
+`Job`, not `Deployment`. The program prints a line and exits. A `Deployment` requires `restartPolicy: Always`, so Kubernetes would restart the container on a clean `exit 0`, again and again, and report `CrashLoopBackOff` for a program that never failed.
+
+Rewriting the application to loop forever was rejected: that adapts the program to the tool instead of picking the right tool.
+
 
 ### Choosing which version to deploy
 
-The version is set as `appVersion` in `Chart.yaml`, and `values.yaml` holds an
-empty `image.tag`. The template uses the tag when one is given and falls back to
-`appVersion` when it isn't:
+`values.yaml` holds an empty `image.tag`, and the template falls back to `appVersion` from `Chart.yaml` when none is given:
 
 ```yaml
 image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
@@ -1018,15 +1097,26 @@ different one would mean editing, committing and merging a file. Together the
 chart has a sensible default that is recorded in git, and an escape hatch for
 everything else.
 
-### Chart version bump
+### appVersion is not updated automatically
 
-The pipeline updates `appVersion` alongside the pom version on every release, so
-the chart's default always points at the most recent published image rather than
-drifting behind it.
-- Updating the chart thru the pipline is possible by taking the new app version and adding it to the Chart.yaml file           
-`sed -i "s/^appVersion:.*/appVersion: \"$NEW\"/" ../chart/Chart.yaml`        
-- Then the change is commited to git with the pom.xml file       
-`git add myapp/pom.xml chart/Chart.yaml`
+`appVersion` is a fixed `1.0.0`, and the pipeline never writes to it.
+
+An earlier version updated it with `sed` alongside the pom and committed both. That mechanism is gone with the commit-back approach (section 1), and there is nothing left to update it: a `sed` on the runner would edit a file that is discarded when the job ends.
+
+The pipeline passes `--set image.tag` at install time instead, which sits at the top of Helm's value precedence. `appVersion` remains the default for a manual `helm install ./chart` with no flags, and is raised by hand when `MAJOR` or `MINOR` moves in the pom.
+
+### Deployment in the pipeline
+
+Every run deploys, in a kind cluster created inside the runner:
+
+```bash
+helm install hello chart/ \
+  --set image.repository="$REPO" \
+  --set image.tag="$VERSION" \
+  --wait --wait-for-jobs --timeout 3m
+```
+
+The cluster starts empty, so the image is pulled from Docker Hub rather than loaded locally, which makes the deployment a real test of what was published. `helm template` runs first as a guard, verifying the chart renders the expected image reference before anything is installed. Section 7 covers both.
 
 ### Folder structure
 
@@ -1041,8 +1131,8 @@ drifting behind it.
 - `name: maven-hello-world` - the chart name
 - `description: Hello World Java app deployed as a Kubernetes Job` - the chart description
 - `type: application` - chart type
-- `version: 0.1.0` - the chart version, changes when we change the chart not the app.
-- `appVersion: "1.0.2"` - the app version that runs inside the cluster
+- `version: 0.1.0` - the chart version, changes when the chart changes, not the app
+- `appVersion: "1.0.0"` - the default app version, used only when no `--set image.tag` is given
 
 ### chart/Values.yaml
 
@@ -1054,7 +1144,7 @@ drifting behind it.
 - `kind: Job` - uses a job workload the reason for that is explaind in the workload part
 - `name: {{ .Release.Name }}` - uses the name we gave in the install command as the name of the relase
 - `ttlSecondsAfterFinished: 300` - delete the job 300 seconds after the job is done
-- `restartPolicy: Never` - done try to reload the pod after the job has ended (the other optin is OnFailure and is not comptabile with the use case here)
+- `restartPolicy: Never` - do not restart the pod after the job has ended. The other option is `OnFailure`, which is not compatible with this use case
 - `image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"`      
 {{ .Values.image.repository }} - uses the image.repostery name from the chart/Values.yaml file.         
 {{ .Values.image.tag | default .Chart.AppVersion }} - takes the version either from the --set command in the cli or the values.yaml file if nither xsist takes it from Chart.yaml

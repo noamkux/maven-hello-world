@@ -26,6 +26,9 @@ jobs:
                   fetch-depth: 0
                   filter: tree:0
 
+            - name: Lint chart
+              run: helm lint chart/
+
             - name: Set up JDK 17
               uses: actions/setup-java@v4
               with:
@@ -137,7 +140,6 @@ jobs:
               env:
                   VERSION: ${{ steps.version.outputs.new }}
               run: |
-                  helm lint chart/
 
                   helm install hello chart/ \
                     --set image.repository="$REPO" \

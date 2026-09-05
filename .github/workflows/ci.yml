@@ -153,6 +153,15 @@ jobs:
               env:
                   VERSION: ${{ steps.version.outputs.new }}
               run: |
+                  RENDERED=$(helm template hello chart/ \
+                    --set image.repository="$REPO" \
+                    --set image.tag="$VERSION" \
+                    | grep -oP '^\s*image:\s*"?\K[^"]+')
+
+                  echo "Chart renders image: $RENDERED"
+                  [ "$RENDERED" = "$REPO:$VERSION" ] || {
+                    echo "::error::chart renders $RENDERED, expected $REPO:$VERSION"
+                    exit 1; }
 
                   helm install hello chart/ \
                     --set image.repository="$REPO" \

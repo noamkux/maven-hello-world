@@ -28,6 +28,12 @@ jobs:
                   fetch-depth: 0
                   filter: tree:0
 
+            - name: Log in to Docker Hub
+              uses: docker/login-action@v3
+              with:
+                  username: ${{ vars.DOCKERHUB_USERNAME }}
+                  password: ${{ secrets.DOCKERHUB_TOKEN }}
+
             - name: Lint chart
               run: helm lint chart/
 
@@ -44,33 +50,39 @@ jobs:
                   CURRENT=$(mvn -B -q -ntp help:evaluate -Dexpression=project.version -DforceStdout)
 
                   [[ "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-                  echo "::error::unexpected version format: '$CURRENT' (expected X.Y.Z)"
-                  exit 1; }
+                    echo "::error::unexpected version format: '$CURRENT' (expected X.Y.Z)"
+                    exit 1; }
 
                   MAJOR=$(echo "$CURRENT" | cut -d. -f1)
                   MINOR=$(echo "$CURRENT" | cut -d. -f2)
-
                   LAST=$(git tag -l "v$MAJOR.$MINOR.*" --sort=-v:refname | head -n1)
+
                   if [ -z "$LAST" ]; then
-                    NEW="$MAJOR.$MINOR.0"
+                    PATCH=0
                     OLD="none"
                   else
-                    PATCH=$(echo "$LAST" | cut -d. -f3)
-                    NEW="$MAJOR.$MINOR.$((PATCH + 1))"
+                    PATCH=$(( $(echo "$LAST" | cut -d. -f3) + 1 ))
                     OLD="${LAST#v}"
                   fi
+
+                  NEW="$MAJOR.$MINOR.$PATCH"
+
+                  git rev-parse "v$NEW" >/dev/null 2>&1 && {
+                    echo "::error::v$NEW already exists in git — version computation is broken"
+                    exit 1; }
+
+                  for _ in $(seq 1 20); do
+                    docker manifest inspect "$REPO:$NEW" >/dev/null 2>&1 || break
+                    echo "::warning::$REPO:$NEW is already published but has no git tag — skipping"
+                    PATCH=$((PATCH + 1))
+                    NEW="$MAJOR.$MINOR.$PATCH"
+                  done
 
                   echo "new=$NEW" >> "$GITHUB_OUTPUT"
                   echo "Version bump: $OLD -> $NEW"
 
             - name: Set up Buildx
               uses: docker/setup-buildx-action@v3
-
-            - name: Log in to Docker Hub
-              uses: docker/login-action@v3
-              with:
-                  username: ${{ vars.DOCKERHUB_USERNAME }}
-                  password: ${{ secrets.DOCKERHUB_TOKEN }}
 
             - name: Build image
               uses: docker/build-push-action@v6
@@ -130,8 +142,7 @@ jobs:
               run: |
                   docker rmi "$REPO:$VERSION" "$REPO:latest"
                   docker pull "$REPO:$VERSION"
-                  OUTPUT=$(docker run --rm "$REPO:$VERSION")
-                  echo "$OUTPUT"
+                  docker run --rm "$REPO:$VERSION"
 
             - name: Create kind cluster
               uses: helm/kind-action@v1

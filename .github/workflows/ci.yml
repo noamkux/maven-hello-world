@@ -79,6 +79,7 @@ jobs:
                   done
 
                   echo "new=$NEW" >> "$GITHUB_OUTPUT"
+                  echo "new=$OLD" >> "$GITHUB_OUTPUT"
                   echo "Version bump: $OLD -> $NEW"
 
             - name: Set up Buildx

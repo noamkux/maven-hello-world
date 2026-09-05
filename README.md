@@ -684,197 +684,201 @@ should return a size of 250 MB
 
 ## 7 Workflow
 
-Create a ci.yml file.
+Two workflows, with different questions and different privileges.
 
-[ci.yml](/maven-hello-world/.github/workflows/ci.yml)
+| | `pr.yml` | `ci.yml` |
+|---|---|---|
+| Asks | is this fit to merge? | is this fit to publish? |
+| Triggers on | `pull_request` to `main` | `push` to `main`, or manual dispatch |
+| Computes a version | no | yes |
+| Publishes | no | yes |
 
-```bash
-cd ~/github/maven-hello-world
-mkdir -p .github/workflows
-cd .github/workflows
-touch ci.yml
+Section 8 covers `pr.yml`. This section is `ci.yml`.
+
+[ci.yml](.github/workflows/ci.yml)
+
+### Trigger
+
+```yaml
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - ".gitignore"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Publish to the scratch repo and skip tagging"
+        type: boolean
+        default: true
 ```
 
-### Trigger & Permissions
+Since `main` only accepts merges, `push` to `main` means "a pull request was merged". `paths-ignore` keeps a documentation edit from producing a release: a new version number should mean the artifact changed.
 
-**trigger :** The pipline will triger only on push to the main branch and on manual dispatch.
+`workflow_dispatch` adds the dry run, covered at the end of this section.
 
+**timeout-minutes: 20.** The default is 360, six hours of runner time before a hung `docker pull` or a stalled Maven download is cut off. A normal run finishes in 3 to 5 minutes.
 
-**permissions :** `permissions: {}` — no scopes at all. `GITHUB_TOKEN` is
-created for every run regardless of whether it is used, so the empty block is
-what reduces it to `none` everywhere. The pipeline pushes over SSH with a deploy
-key and never touches the token. Full reasoning in section 3.
+### Concurrency
 
-**timeout-minutes :** `20`. The default is 360 — six hours of runner time
-before a hung `docker pull` or a stalled Maven download is cut off. A normal run
-finishes in 3–5 minutes, so this leaves room without being theoretical.
+```yaml
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+```
+
+Two merges landing close together would otherwise run in parallel, read the same highest tag, and compute the same version. `cancel-in-progress: false` is the important half: the second run waits instead of replacing the first, because a run that is midway through publishing an image should finish and record its tag rather than be killed halfway.
 
 ### Job-level variables
 
-`REPO` is declared once in the job's `env` block and used by every step that
-references the image:
-
 ```yaml
 env:
-    REPO: ${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world
+  REPO: ${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world${{ inputs.dry_run && '-ci' || '' }}
 ```
 
-The `env` context is available both in `with:` blocks and in shell steps, so one
-declaration covers the build action and the scripts alike. `VERSION` cannot live
-there — the `steps` context does not exist at job level, since step outputs are
-produced during the run — so it is declared per step instead.
+Declared once and used by every step that names the image.
+The suffix is what routes a dry run to the scratch repository. On a `push` trigger `inputs.dry_run` does not exist, evaluates as falsy, and the expression yields the release repository.
+
 
 ### Checkout
 
- - runs-on - settings the VM OS to ubuntu 22.04, usuing a specific version and not latest to ensure consistency
- - Checkout - uses the action : `actions/checkout@v4` which clones the repo to the runner.
- - Set up JDK 17 - uses `actions/setup-java@v4` with `distribution: temurin`, the
-   same distribution as both Docker base images. The runner compiles nothing, but
-   `help:evaluate` and `versions:set` run there and need Maven.
+```yaml
+- uses: actions/checkout@v4
+  with:
+    fetch-depth: 0
+    filter: tree:0
+```
+
+`runs-on: ubuntu-22.04` rather than `ubuntu-latest`, so a runner image update cannot change the build under you.
+
+`fetch-depth: 0` fetches the full history, because the default shallow clone brings no tags and the version is computed from them.     
+`filter: tree:0` makes it a blobless clone: all commits and all refs, none of the file contents, fetched lazily only if something asks for them. Nothing here does, since the version comes from ref names alone.
 
 ### Determine next version
 
-Reads the current version, validates it, and computes the next one. This step
-only calculates — nothing is written here.
-
-- `CURRENT=$(mvn -B -q help:evaluate -Dexpression=project.version -DforceStdout)` —
-  asks Maven for the effective project version. Not `grep`: this pom has ten
-  `<version>` elements and only one of them is the project's. `-q` silences the
-  logs and `-DforceStdout` forces a clean value to stdout.
-
-- The format is validated before anything is parsed:
+Reads the series from the pom, finds the highest tag in it, and adds one. This step only calculates.
 
 ```bash
+CURRENT=$(mvn -B -q -ntp help:evaluate -Dexpression=project.version -DforceStdout)
+
 [[ "$CURRENT" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
   echo "::error::unexpected version format: '$CURRENT' (expected X.Y.Z)"
   exit 1; }
 ```
 
-  Without this guard the arithmetic below does not fail on malformed input, it
-  produces a wrong answer. Bash evaluates an empty or non-numeric variable as `0`
-  in arithmetic context, so `1.0` yields `1.0.1` with a patch component that
-  never existed, and `1.0.0-SNAPSHOT` yields `1.0.1` — silently turning a
-  development version into a release.
+`help:evaluate` rather than grepping the XML: this pom holds ten `<version>` elements and only one is the project's. It asks Maven for the effective version after inheritance and property resolution. `-q` silences the logs, `-DforceStdout` puts a clean value on stdout.
 
-
-- Once the guard passes, `CURRENT` is known to be three numeric fields, so the
-  split and the increment are operating on a validated string:
+The guard exists because bash arithmetic does not fail on malformed input, it produces a wrong answer. An empty or non-numeric field evaluates as `0`, so `1.0` would yield a patch component that never existed and `1.0.0-SNAPSHOT` would silently become a release.
 
 ```bash
 MAJOR=$(echo "$CURRENT" | cut -d. -f1)
 MINOR=$(echo "$CURRENT" | cut -d. -f2)
-PATCH=$(echo "$CURRENT" | cut -d. -f3)
-NEW="$MAJOR.$MINOR.$((PATCH + 1))"
+LAST=$(git tag -l "v$MAJOR.$MINOR.*" --sort=-v:refname | head -n1)
+
+if [ -z "$LAST" ]; then
+  PATCH=0
+  OLD="none"
+else
+  PATCH=$(( $(echo "$LAST" | cut -d. -f3) + 1 ))
+  OLD="${LAST#v}"
+fi
+
+NEW="$MAJOR.$MINOR.$PATCH"
 ```
 
-  `-d.` sets the delimiter, `cut` fields are numbered from 1. 
+The glob restricts the search to the series the pom declares, so raising the pom to `2.0.0` starts a fresh count without touching the `v1.0.*` tags. `--sort=-v:refname` is a version sort, not a lexicographic one: the default ordering puts `v1.0.9` above `v1.0.17`. `${LAST#v}` strips the leading `v`.
 
-- Both values are published as step outputs:
+`PATCH=0` when the series is empty, so `2.0.0` in the pom releases as `2.0.0`. Changing `MAJOR` or `MINOR` is a statement about which version this is, not a starting point for the next one.
+
+```bash
+git rev-parse "v$NEW" >/dev/null 2>&1 && {
+  echo "::error::v$NEW already exists in git — version computation is broken"
+  exit 1; }
+
+for _ in $(seq 1 20); do
+  docker manifest inspect "$REPO:$NEW" >/dev/null 2>&1 || break
+  echo "::warning::$REPO:$NEW is already published but has no git tag — skipping"
+  PATCH=$((PATCH + 1))
+  NEW="$MAJOR.$MINOR.$PATCH"
+done
+```
+
+Two guards against reusing a version number, deliberately behaving differently.
+
+The first is impossible if the code is right: the tag was just derived as the highest plus one, so finding it already present means the computation is broken or someone changed the pom.xml version. It fails the run.
+
+The second is a state the system can recover from. A run that published an image and then failed before tagging leaves a number that git does not know about, and the next run would compute it again and overwrite a published image. The loop detects that and moves forward. `git rev-parse` rather than `git tag -l` here, because it returns an exit code instead of matching text.
+
+**The resulting gap in the tags is correct, not a defect.** Git records releases, not builds. A version that was published but never tagged is an artifact that never became a release, and its absence is the accurate record. The computation takes the maximum and adds one, so it never needs the sequence to be continuous.
 
 ```bash
 echo "new=$NEW" >> "$GITHUB_OUTPUT"
-echo "old=$CURRENT" >> "$GITHUB_OUTPUT"
+echo "old=$OLD" >> "$GITHUB_OUTPUT"
 ```
 
-  `$GITHUB_OUTPUT` is an environment variable holding a path to a temp file. At
-  the end of the step the runner publishes each `key=value` line as an output of
-  this step's `id`, reachable as `steps.version.outputs.new`.
+`$GITHUB_OUTPUT` holds a path to a temporary file. At the end of the step the runner publishes each `key=value` line as an output of this step's `id`, reachable as `steps.version.outputs.new` and, through the job's `outputs:` block, as `needs.build.outputs.version` in the `tag` job.
 
 
-### Bump pom.xml
+### Set up Buildx
 
-```bash
-mvn -B versions:set -DnewVersion="$NEW" -DgenerateBackupPoms=false
+`docker/setup-buildx-action@v3` creates a `docker-container` builder. Docker already uses BuildKit by default, but the built-in `docker:default` builder cannot export or import a layer cache, so without this step `cache-to` and `cache-from` do nothing and every run rebuilds from scratch, making the layer ordering in the Dockerfile worthless in CI.
+
+
+### Build image
+
+```yaml
+- uses: docker/build-push-action@v6
+  with:
+    context: .
+    load: true
+    push: false
+    build-args: |
+      APP_VER=${{ steps.version.outputs.new }}
+    tags: ${{ env.REPO }}:${{ steps.version.outputs.new }}
+    cache-from: type=gha
+    cache-to: type=gha,mode=max
 ```
 
-Writes the new version into the pom on the runner. The Docker build that follows
-picks it up automatically, since `COPY myapp/pom.xml` copies the modified file.
+`push: false` with `load: true`: the image is exported from the builder into the local Docker daemon and nothing leaves the runner. Everything that follows tests a real local image, and the push is a separate step later, so exactly the object that passed the checks is the one published.
 
-`-DgenerateBackupPoms=false` suppresses the `pom.xml.versionsBackup` file the
-plugin writes by default. On a runner the working tree is discarded when the job
-ends, and the backup would otherwise have to be excluded from the commit.
+Only the version tag is applied. `latest` is created at the end, after the deployment succeeds.
 
-### Bump helm chart
-
-The chart carries the application version in its own metadata, so the same value
-has to reach two files. `Chart.yaml` is plain YAML with no build tool behind it,
-so this is a text substitution:
-
-```bash
-sed -i "s/^appVersion:.*/appVersion: \"$NEW\"/" chart/Chart.yaml
-grep -q "^appVersion: \"$NEW\"$" chart/Chart.yaml || {
-  echo "::error::failed to update appVersion in chart/Chart.yaml"
-  exit 1; }
-```
-
-`sed` exits `0` whether or not the pattern matched anything — for a stream
-editor, finding nothing to replace is a valid outcome, not an error. Any change
-to how the field is written in `Chart.yaml`, such as indentation or a space
-before the colon, would stop the pattern matching. The run would then finish
-green with the chart still on an old version, and `git add` would find nothing
-to stage, so the commit would succeed too. The mismatch would surface only when
-someone ran `helm install` and got an image they did not expect.
-
-The exit code of `sed` carries no information here because `sed` exits `0` 
-whether or not the pattern matched anything, so the assertion cant happend here.
-To check that the change to the chart was acctualy made grep is used to find 
-the correct line, if not exsisting it will fail the pipeline.
-
-### Buildx
-
-Use the docker/setup-buildx-action@v3 to install buildx, the main reason for using buildx is
-that it creates a `docker-container` builder, which can export and import its layer cache.
-Docker already uses BuildKit by default, but the built-in `docker:default` builder cannot do
-that — so without this step `cache-to` and `cache-from` fail and every CI run rebuilds from
-scratch, making the layer ordering in the Dockerfile worthless in the pipeline.
-
-### Docker login
-
-Use the docker/login-action@v3 to allow communication with docker hub, inject the user name and password from github vars/sercrets (i have enterd those value at step "3 Setup"), it preform a docker login and write the credentials to `~/docker/.config.json`. 
-
-### Build the image
-
-uses the docker/build-push-action@v6 with the follwing arguments
-- push: `false` - after the image is built dont push it to the registry, we want to test first and the push
-- load: `true` - import the image from the builder continer to the docker daemon
-- tags: `${{ env.REPO }}:${{ steps.version.outputs.version }}` - tags the image with the correct version, same as above we got the version from the Determine next version phase
-- `${{ env.REPO }}:latest` a second tag named latest.
-- cache-from: `type=gha` use the cache that is stored at git hub action cache a service that allows to store data outside the VM and call it for futere use, this is what makes our build faster with the usage of caching
-- cache-to: `type=gha,mode=max` - where to cache the data, its the other side of the same coin, the `mode=max` arg tells github to store layers that are not present in the final image 
+`mode=max` caches intermediate layers as well as those in the final image. With a multistage build the default `min` would cache nothing from the build stage, which is where all the expensive work happens.
 
 ### Smoke test
 
-decided to make two checks before uploading the image and the artifact, this check are relvent to the code i wrote in the docker file and not the code the developer wrote
-
-**entrypoint check** - make sure the entry point in the docker file works and dosent return a status code diffrent the 0. it works because github action runs each script with the set -e command which drops the whole pipline if an exit code return a diffrent value then 0
-`docker run --rm "$IMAGE"`
-
-
-**non root user** - run the continer and ask for the user id back, ensure the user is not root
+Two checks on the image, both about the Dockerfile rather than the application code.
 
 ```bash
+docker run --rm "$IMAGE"
+
 RUN_UID=$(docker run --rm --entrypoint id "$IMAGE" -u)
-echo "Running as UID: $RUN_UID"
 [ "$RUN_UID" != "0" ] || {
-  echo "::error::container runs as root", exit 1, }
+  echo "::error::container runs as root"; exit 1; }
 ```
+
+The first verifies the entrypoint resolves and the process exits `0`. Actions runs each script with `set -e`, so a non-zero exit fails the step on its own.
+
+The second checks the effective UID. `--entrypoint id` replaces the entrypoint for this run, and `-u` is passed as an argument to it. This asserts what the base image and `USER` actually produce, rather than trusting that the Dockerfile says what it means.
 
 ### Extract jar from image
 
-- `IMAGE="${{ env.REPO }}:${{ steps.version.outputs.version }}"` - save the image name as a varibale named IMAGE, 
-- `docker create "$IMAGE"` - uses the same image we just build and create a continar with this image, use docker create and not run because we dont need to run the continar we only need to acsses its FS to grab the jar file
-- `docker cp "$CID:/app/app.jar" "./myapp-${{ steps.version.outputs.version }}.jar"` - use docker cp to copy the image from the conatiner FS to the local FS of the runner
-- `docker rm "$CID"` - delete the container 
-- `ls -lh ./myapp-*.jar` to check the file is present
+```bash
+CID=$(docker create "$IMAGE")
+docker cp "$CID:/app/app.jar" "./$JAR"
+docker rm "$CID"
+```
+
+`docker create` builds a container's filesystem without starting it, which is all that is needed to read a file out of it.
+
+Taking the jar from the image rather than building it separately on the runner means the artifact is byte-identical to what runs in production. A second `mvn package` would produce a jar that was probably the same, which is a weaker claim.
 
 ### Upload jar artifact
 
-- `actions/upload-artifact@v4` upload an artifact to git hub, enable to download the artifact directly from github for inspection.
+`actions/upload-artifact@v4`, with `if-no-files-found: error` so a rename or a path change fails loudly instead of uploading nothing.
 
-- `retention-days: 14` overrides the 90-day default. The jar already exists as a
-layer in the published image, so this artifact is a convenience for manual
-inspection rather than an archive, and does not need to outlive the interest in
-a given run.
+`retention-days: 14` overrides the 90-day default. The jar already exists as a layer in the published image, so this is a convenience for inspection rather than an archive.
 
 ### Push to Docker hub
 

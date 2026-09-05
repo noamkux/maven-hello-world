@@ -28,3 +28,32 @@ jobs:
 
             - name: Set up Buildx
               uses: docker/setup-buildx-action@v3
+
+            - name: Smoke test
+              env:
+                  IMAGE: ${{ env.REPO }}:${{ steps.version.outputs.new }}
+              run: |
+                  echo "--- entrypoint check ---"
+                  docker run --rm "$IMAGE"
+
+                  echo "--- non-root check ---"
+                  RUN_UID=$(docker run --rm --entrypoint id "$IMAGE" -u)
+                  echo "Running as UID: $RUN_UID"
+                  [ "$RUN_UID" != "0" ] || {
+                    echo "::error::container runs as root"; exit 1; }
+
+            - name: Create kind cluster
+              uses: helm/kind-action@v1
+              with:
+                  cluster_name: pr
+
+            - name: Deploy with Helm
+              run: |
+                  kind load docker-image "$IMAGE" --name pr
+
+                  helm install hello chart/ \
+                    --set image.repository=maven-hello-world \
+                    --set image.tag=pr \
+                    --wait --wait-for-jobs --timeout 3m
+
+                  kubectl logs job/hello

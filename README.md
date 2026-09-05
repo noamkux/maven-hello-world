@@ -1,8 +1,8 @@
 # maven-hello-world — CI/CD Pipeline
 
-A Java/Maven "Hello World" application with a fully automated GitHub Actions
-pipeline: automatic patch version bumping in pom.xml, multistage Docker build, non-root
-runtime, Docker Hub publishing, and Kubernetes deployment via Helm.
+A Java/Maven "Hello World" application with fully automated GitHub Actions
+pipelines: automatic patch version bumping using git tags, multistage Docker build, non-root
+runtime, Docker Hub publishing, and Kubernetes deployment via Helm to a kind cluster.
 
 Forked from ido83/maven-hello-world - https://github.com/ido83/maven-hello-world
 
@@ -20,13 +20,13 @@ Forked from ido83/maven-hello-world - https://github.com/ido83/maven-hello-world
 ### Pipeline flow
 
 ```
-merge PR to main
+push to main
       |
       v
-  read version from pom.xml  ->  bump patch  ->  versions:set
+  read MAJOR.MINOR from pom.xml  ->  find highest matching git tag  ->  bump patch
       |
       v
-  multistage docker build  (pom already carries the new version)
+  multistage docker build  (version injected as --build-arg APP_VER)
       |
       v
   smoke test  (entrypoint + non-root)
@@ -34,112 +34,61 @@ merge PR to main
       +--> extract jar from image  ->  upload as build artifact
       |
       v
-  push image to Docker Hub  (jar version + latest)
+  push image to Docker Hub  (version tag only)
       |
       v
   pull the pushed image and run it
       |
       v
-  commit the pom and tag the release  (v1.0.1)
+  deploy to a kind cluster with Helm
+      |
+      v
+  promote :latest
+      |
+      v
+  tag the release  (v1.0.1)
 ```
 
-The commit and tag are created last, after the image has been built, verified,
-published, pulled and run. A failure anywhere earlier leaves the repository
-untouched, so the version sequence has no gaps for builds that never produced an
-image.
+**Three writes leave the runner**, in ascending order of what a failure costs. `:VERSION` goes first, because the kind deployment pulls it from Docker Hub - that pull is what proves the published image is the one that runs.       
+A version tag of a build that later fails deployment is harmless: nothing points at it and
+nothing resolves to it by accident. `:latest` moves only after the deploy succeeds, since it is the tag people pull without thinking.        
+The `git tag` is created last, so the release record exists only for an artifact that was proven
+end to end.
+
 
 ### Versioning Strategy
 
-Two approaches were implemented during this project. The second replaced the
-first, and was then reverted after a review raised a problem it did not solve.
+The assignment requires a jar at `1.0.0` whose patch component then increments automatically on every build.       
+That is one number that has to live somewhere and move.      
+There are three places it can live.
 
-**The requirement.** Task 5.2 sets the jar version to `1.0.0`, task 6.1
-increases the patch part of *that* version automatically. They are one
-requirement in two steps: a number that lives in the project and moves.
+**A — the pom is the source of truth.** The pipeline reads the version, bump it, writes it back with `versions:set`, and commits the modified pom.
 
-#### Option A — the version lives in pom.xml (chosen)
+**B — git tags are the source of truth.** The pom holds a placeholder such as `0.0.0-SNAPSHOT`, and the pipeline derives the version from the latest tag.
 
-`mvn help:evaluate` reads the current version, the patch is incremented,
-`mvn versions:set` writes it back, and the pipeline commits the modified pom and
-tags the commit.
+**C — split by who decides.** The pom declares `MAJOR.MINOR` and never changes in CI.       
+Tags carry `PATCH`. The pipeline reads the series from the pom, finds the highest tag in it, and adds one.
 
-The version is read with `help:evaluate` rather than grepped out of the XML: this
-pom contains ten `<version>` elements, most of them plugin versions, and
-`help:evaluate` asks Maven for the effective project version after inheritance
-and property resolution.
+**Chosen: C.**
 
-**For:**
+**Why not A.** It requires the pipeline to write to a protected branch, which means a bypass entry on the ruleset for an automated identity — a permission no human contributor to this repository has.      It also creates a trigger loop needing `[skip ci]`, a race between overlapping runs reading the same pom, and automated commits in the history.     
+All three were hit in practice before the approach was
+dropped.
 
-- It is what the exercise asks for. The version is in the file, visible, and the
-  mechanism is demonstrated by running the pipeline twice and reading one line.
-- **A developer who clones the repository knows what version they have.** This is
-  the argument that decided it. `mvn package` on a fresh clone produces
-  `myapp-1.0.7.jar`, matching the published image. The IDE shows the real
-  version, a consuming project resolves the right artifact, and tools that read
-  the pom report accurately.
+**Why not B.** The pom stops stating anything true. A developer who clones the repository sees a placeholder, builds a placeholder jar, and has no way to know from the working tree what the current release is.      
+The pom is the file every tool in the Java ecosystem treats as the project's identity.
 
-**Against, measured rather than assumed:**
+**Why C works.** The pom is not pretending to be the version — it declares the series, which is exactly what it is authoritative about.       
+`MAJOR` and `MINOR` are human decisions, edited by hand in the file that records decisions.      
+`PATCH` is a mechanical count of releases, kept where releases are already recorded.      
+Nothing writes to `main`, so no bypass, no loop, no race.
 
-- It invalidates the Docker layer cache every run. BuildKit hashes each layer
-  against the result of the layers before it, so the dependency layer's key
-  includes the output of `COPY myapp/pom.xml`. Rewriting one character changes
-  that file's hash entirely and invalidates `dependency:go-offline` beneath it,
-  re-downloading every Maven dependency.
-- It requires writing to a protected branch — a bypass entry for
-  `github-actions[bot]` on the ruleset.
-- It creates a trigger loop, mitigated with `[skip ci]`.
-- It leaves automated commits in the history.
+**The version still reaches the artifact.** It is passed to the build as `--build-arg APP_VER` and applied by `versions:set` *inside* the Dockerfile, after the dependency layer. The jar is therefore built from the real pom and `META-INF/maven/com.myapp/myapp/pom.properties` carries the released version.
+Section 6 covers why the `ARG` sits where it does.
 
-#### Option B — the version lives in git tags
-
-The pom holds `<version>${revision}</version>` defaulting to `0.0.0-SNAPSHOT`,
-using Maven's CI-Friendly Versions mechanism. The pipeline reads the latest tag
-with `git describe`, increments the patch, and injects the result as
-`--build-arg REVISION` — declared in the Dockerfile *after* the dependency layer,
-so a version change does not invalidate it.
-
-This was fully implemented and measured:
-
-| Build | Total | `dependency:go-offline` |
-|---|---|---|
-| First build, cold | 73.8s | 69.0s |
-| Version-only change | **5.0s** | **CACHED** |
-
-Under Option A the second build takes roughly 70 seconds again. Option B also
-needs no write to the branch, no bypass, no trigger loop, and leaves no automated
-commits — three concrete advantages against one.
-
-**Why it was not kept:** the pom no longer states the real version. A developer
-cloning the repository sees `0.0.0-SNAPSHOT`, builds `myapp-0.0.0-SNAPSHOT.jar`,
-and has no way to know from the working tree that the current release is `1.0.7`.
-Only `git tag -l` reveals it. The pom is accurate only inside the pipeline — the
-one place nobody reads it.
-
-That is not a presentation problem. The pom is the file every tool in the Java
-ecosystem treats as the project's identity, and under Option B it is wrong on
-every machine except the CI runner.
-
-#### Reordering was considered and does not help
-
-Building first and updating the pom only at the end keeps the pom stable *during*
-a run — but the next run still sees a changed file, so the `COPY` layer breaks
-anyway. Once the version lives in a file under version control, that layer changes
-every release regardless of when in the pipeline it is written. It is a
-consequence of the approach, not of the ordering.
-
-#### The decision
-
-Option A, accepting roughly 69 seconds of rebuild per run. The exercise asks for a
-version in the project that increments, and a developer reading the repository
-should see the same number the registry does. A faster pipeline that reports the
-wrong version solves a different problem.
-
-Git tags are still created, so the version has two synchronised representations:
-the pom defines it, the tag records it in history.
-
-The caching penalty is real but small at this scale, and it is a performance cost
-rather than a correctness one. Section 12 covers how it would be removed where it
-mattered.
+**Measured.** A build with a new version took **83.1s** under A and **20.1s**
+under C. The difference is the `dependency:go-offline` layer, 61.8s, which stays
+cached because the pom no longer changes between runs.
 
 ---
 

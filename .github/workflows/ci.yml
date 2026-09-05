@@ -7,6 +7,11 @@ on:
             - "**.md"
             - ".gitignore"
     workflow_dispatch:
+        inputs:
+            dry_run:
+                description: "Publish to the scratch repo and skip tagging"
+                type: boolean
+                default: true
 
 permissions:
     contents: read
@@ -22,7 +27,7 @@ jobs:
         outputs:
             version: ${{ steps.version.outputs.new }}
         env:
-            REPO: ${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world
+            REPO: ${{ vars.DOCKERHUB_USERNAME }}/maven-hello-world${{ inputs.dry_run && '-ci' || '' }}
 
         steps:
             - name: Checkout
@@ -192,6 +197,7 @@ jobs:
 
     tag:
         needs: build
+        if: ${{ !inputs.dry_run }}
         runs-on: ubuntu-22.04
         timeout-minutes: 5
         permissions:
